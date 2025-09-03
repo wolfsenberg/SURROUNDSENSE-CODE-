@@ -38,7 +38,7 @@ def get_center():
 
 MAX_CM = 70
 SCALE = 5                    
-MAP_SMOOTH_N = 8             
+MAP_SMOOTH_N = 3             # REDUCED for more responsive mapping
 BEAM_SMOOTH_N = 2            
 
 # COLORS
@@ -54,8 +54,21 @@ DARK_GRAY = (30, 30, 30)
 BLUE = (100, 150, 255)
 ORANGE = (255, 165, 0)
 PURPLE = (200, 100, 255)
+CYAN = (0, 255, 255)
 
 PADDING_TOP = 30
+
+# 3D RENDERING SETTINGS
+VIEW_MODE_2D = 0
+VIEW_MODE_3D = 1
+view_mode = VIEW_MODE_2D
+
+# 3D Camera settings
+camera_angle_x = -30  # Tilt down to see the surface
+camera_angle_y = 0    # Rotation around Y axis
+camera_distance = 400 # Distance from center
+camera_height = 200   # Height above the scan plane
+auto_rotate = True    # Auto rotate in 3D mode
 
 # ===== SERIAL =====
 PORT = find_arduino_port()
@@ -252,9 +265,9 @@ MINI_WIDTH, MINI_HEIGHT = 400, 300
 # SCREENSHOT STATE
 screenshot_message = ""
 screenshot_timer = 0
+taking_screenshot = False  # NEW FLAG TO TRACK SCREENSHOT PROCESS
 
 # ===== STATE =====
-map_dist_hist = deque(maxlen=MAP_SMOOTH_N)
 map_yaw_hist = deque(maxlen=MAP_SMOOTH_N)
 beam_yaw_hist = deque(maxlen=BEAM_SMOOTH_N)
 
@@ -267,12 +280,205 @@ sensor = {
     "gyro": "Still",
 }
 
-distance_plot = 0.0
-beam_distance = 0.0
+# IMPROVED DISTANCE HANDLING - USE RAW DISTANCES FOR ACCURACY
+current_distance = 0.0  # CURRENT RAW DISTANCE FROM SENSOR
+beam_distance = 0.0     # DISTANCE FOR BEAM DISPLAY
 calibrated = False
 yaw_offset = 0.0
 scan_active = False  # SCANNING AND BEAM ONLY ACTIVE AFTER FIRST R PRESS
 scan_points = {}  # angle -> {'coord': (x,y), 'has_object': bool, 'distance': float}
+
+# ===== 3D MATH HELPERS =====
+def rotate_point_3d(x, y, z, angle_x, angle_y, angle_z=0):
+    """Rotate a 3D point around all three axes"""
+    # Convert angles to radians
+    ax, ay, az = math.radians(angle_x), math.radians(angle_y), math.radians(angle_z)
+    
+    # Rotation around X axis
+    y1 = y * math.cos(ax) - z * math.sin(ax)
+    z1 = y * math.sin(ax) + z * math.cos(ax)
+    y, z = y1, z1
+    
+    # Rotation around Y axis
+    x1 = x * math.cos(ay) + z * math.sin(ay)
+    z1 = -x * math.sin(ay) + z * math.cos(ay)
+    x, z = x1, z1
+    
+    # Rotation around Z axis
+    x1 = x * math.cos(az) - y * math.sin(az)
+    y1 = x * math.sin(az) + y * math.cos(az)
+    x, y = x1, y1
+    
+    return x, y, z
+
+def project_3d_to_2d(x, y, z, camera_distance=400):
+    """Project 3D point to 2D screen coordinates with perspective"""
+    if z + camera_distance <= 0:
+        return None, None
+    
+    CENTER_X, CENTER_Y = get_center()
+    
+    # Perspective projection
+    scale_factor = camera_distance / (z + camera_distance)
+    screen_x = CENTER_X + x * scale_factor
+    screen_y = CENTER_Y - y * scale_factor  # Negative because screen Y increases downward
+    
+    return int(screen_x), int(screen_y)
+
+def generate_3d_surface_mesh():
+    """Generate 3D mesh from scan points for extruded surface"""
+    if not scan_points:
+        return []
+    
+    vertices = []
+    triangles = []
+    
+    # Create vertices for the scanned surface
+    angles = sorted(scan_points.keys())
+    extrusion_height = 50  # Height of extrusion in 3D space
+    
+    # Base vertices (on the scan plane)
+    base_vertices = []
+    top_vertices = []
+    
+    for angle in angles:
+        data = scan_points[angle]
+        if data['has_object']:
+            # Convert polar to cartesian (relative to center)
+            distance = data['distance'] * SCALE * 0.3  # Scale down for 3D
+            angle_rad = math.radians(angle)
+            
+            x = distance * math.cos(angle_rad)
+            z = distance * math.sin(angle_rad)  # Use Z as the depth axis
+            
+            # Base vertex (y = 0)
+            base_vertices.append((x, 0, z))
+            # Top vertex (y = extrusion_height)  
+            top_vertices.append((x, extrusion_height, z))
+    
+    # Add center points
+    center_base = (0, 0, 0)
+    center_top = (0, extrusion_height, 0)
+    
+    vertices = [center_base, center_top] + base_vertices + top_vertices
+    
+    # Generate triangles for the surface
+    if len(base_vertices) >= 2:
+        for i in range(len(base_vertices)):
+            next_i = (i + 1) % len(base_vertices)
+            
+            # Base triangle (center to edge)
+            triangles.append((0, 2 + i, 2 + next_i))
+            
+            # Top triangle (center to edge)  
+            triangles.append((1, 2 + len(base_vertices) + next_i, 2 + len(base_vertices) + i))
+            
+            # Side quad (split into two triangles)
+            base_current = 2 + i
+            base_next = 2 + next_i
+            top_current = 2 + len(base_vertices) + i
+            top_next = 2 + len(base_vertices) + next_i
+            
+            # First triangle of quad
+            triangles.append((base_current, base_next, top_current))
+            # Second triangle of quad
+            triangles.append((base_next, top_next, top_current))
+    
+    return vertices, triangles
+
+def draw_3d_wireframe(vertices, triangles):
+    """Draw 3D wireframe mesh"""
+    if not vertices or not triangles:
+        return
+    
+    # Transform and project vertices
+    projected_vertices = []
+    
+    for x, y, z in vertices:
+        # Apply camera rotation and position
+        rx, ry, rz = rotate_point_3d(x, y, z, camera_angle_x, camera_angle_y)
+        
+        # Project to 2D
+        screen_x, screen_y = project_3d_to_2d(rx, ry, rz - camera_distance)
+        
+        if screen_x is not None and screen_y is not None:
+            projected_vertices.append((screen_x, screen_y))
+        else:
+            projected_vertices.append(None)
+    
+    # Draw triangles as wireframe
+    for triangle in triangles:
+        points = []
+        valid = True
+        
+        for vertex_idx in triangle:
+            if vertex_idx < len(projected_vertices) and projected_vertices[vertex_idx] is not None:
+                points.append(projected_vertices[vertex_idx])
+            else:
+                valid = False
+                break
+        
+        if valid and len(points) == 3:
+            # Draw triangle edges
+            for i in range(3):
+                start_point = points[i]
+                end_point = points[(i + 1) % 3]
+                
+                # Check if points are within screen bounds
+                if (0 <= start_point[0] < WIDTH and 0 <= start_point[1] < HEIGHT and
+                    0 <= end_point[0] < WIDTH and 0 <= end_point[1] < HEIGHT):
+                    pygame.draw.line(screen, LIGHT_GREEN, start_point, end_point, 2)
+
+def draw_3d_filled_surface(vertices, triangles):
+    """Draw 3D filled surface with depth sorting"""
+    if not vertices or not triangles:
+        return
+    
+    # Transform vertices and calculate depths
+    transformed_triangles = []
+    
+    for triangle_idx, triangle in enumerate(triangles):
+        triangle_vertices = []
+        triangle_z_values = []
+        
+        for vertex_idx in triangle:
+            if vertex_idx < len(vertices):
+                x, y, z = vertices[vertex_idx]
+                
+                # Apply camera rotation
+                rx, ry, rz = rotate_point_3d(x, y, z, camera_angle_x, camera_angle_y)
+                
+                # Project to 2D
+                screen_x, screen_y = project_3d_to_2d(rx, ry, rz - camera_distance)
+                
+                if screen_x is not None and screen_y is not None:
+                    triangle_vertices.append((screen_x, screen_y))
+                    triangle_z_values.append(rz)
+                else:
+                    triangle_vertices = []
+                    break
+        
+        if len(triangle_vertices) == 3:
+            avg_z = sum(triangle_z_values) / 3
+            transformed_triangles.append((avg_z, triangle_vertices))
+    
+    # Sort triangles by depth (back to front)
+    transformed_triangles.sort(key=lambda x: x[0], reverse=True)
+    
+    # Draw triangles
+    for avg_z, triangle_vertices in transformed_triangles:
+        # Color based on depth and surface type
+        depth_factor = max(0.3, min(1.0, (avg_z + 200) / 400))
+        
+        # Use green tones for the extruded surface
+        color_intensity = int(150 * depth_factor)
+        surface_color = (0, color_intensity, int(color_intensity * 0.7))
+        
+        # Check if all vertices are on screen
+        if all(0 <= x < WIDTH and 0 <= y < HEIGHT for x, y in triangle_vertices):
+            pygame.draw.polygon(screen, surface_color, triangle_vertices)
+            # Draw outline
+            pygame.draw.polygon(screen, LIGHT_GREEN, triangle_vertices, 1)
 
 # ===== HELPERS =====
 def clamp(v, lo, hi): return max(lo, min(hi, v))
@@ -342,16 +548,42 @@ def get_downloads_folder():
 
 def save_screenshot():
     """SAVE CURRENT SCREEN AS PNG WITH TIMESTAMP TO DOWNLOADS FOLDER"""
-    global screenshot_message, screenshot_timer
+    global screenshot_message, screenshot_timer, taking_screenshot
     
     try:
+        # SET FLAG TO HIDE INSTRUCTION TEXT DURING SCREENSHOT
+        taking_screenshot = True
+        
+        # REDRAW SCREEN WITHOUT INSTRUCTION TEXT
+        screen.fill(BLACK)
+        if not minimized:
+            if scan_active:
+                if view_mode == VIEW_MODE_2D:
+                    draw_radar_display()
+                    draw_scan_data()
+                    if beam_angle is not None:
+                        draw_beam(beam_angle, beam_distance)
+                else:
+                    draw_3d_view()
+            else:
+                draw_idle_screen()
+        draw_ui()
+        pygame.display.flip()
+        
+        # SMALL DELAY TO ENSURE CLEAN RENDER
+        pygame.time.wait(50)
+        
         downloads_dir = get_downloads_folder()
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"SurroundSense_Radar_{timestamp}.png"
+        view_suffix = "3D" if view_mode == VIEW_MODE_3D else "2D"
+        filename = f"SurroundSense_Radar_{view_suffix}_{timestamp}.png"
         filepath = os.path.join(downloads_dir, filename)
         
         pygame.image.save(screen, filepath)
+        
+        # RESET FLAG
+        taking_screenshot = False
         
         screenshot_message = f"SUCCESS|Saved to Downloads: {filename}"
         screenshot_timer = pygame.time.get_ticks() + 4000
@@ -360,6 +592,7 @@ def save_screenshot():
         return True
         
     except Exception as e:
+        taking_screenshot = False
         screenshot_message = f"ERROR|Save failed: {str(e)[:50]}..."
         screenshot_timer = pygame.time.get_ticks() + 4000
         print(f"Screenshot save failed: {e}")
@@ -449,6 +682,44 @@ def draw_radar_display():
         label = font_small.render(f"{angle}°", True, LIGHT_GRAY)
         label_rect = label.get_rect(center=label_pos)
         screen.blit(label, label_rect)
+        
+    # SCANNING INSTRUCTION TEXT - HIDDEN DURING SCREENSHOT OR WHEN SCREENSHOT MESSAGE IS SHOWING
+    if scan_active and not screenshot_message and not taking_screenshot:
+        instruction_text = font_large.render("Rotate the sensor very slow", True, GRAY)
+        text_rect = instruction_text.get_rect(center=(CENTER_X, CENTER_Y + 50))
+        screen.blit(instruction_text, text_rect)
+
+def draw_3d_view():
+    """Draw the 3D extruded view of the scanned area"""
+    global camera_angle_y
+    
+    # Auto-rotate camera in 3D mode
+    if auto_rotate:
+        camera_angle_y += 0.5  # Slow rotation
+        if camera_angle_y >= 360:
+            camera_angle_y = 0
+    
+    # Generate 3D mesh from scan data
+    vertices, triangles = generate_3d_surface_mesh()
+    
+    if vertices and triangles:
+        # Draw filled surface
+        draw_3d_filled_surface(vertices, triangles)
+        
+        # Draw wireframe overlay for better definition
+        draw_3d_wireframe(vertices, triangles)
+    
+    # Draw 3D mode indicator
+    CENTER_X, CENTER_Y = get_center()
+    mode_text = font_large.render("3D VIEW - EXTRUDED SCAN DATA", True, CYAN)
+    text_rect = mode_text.get_rect(center=(CENTER_X, CENTER_Y + 100))
+    screen.blit(mode_text, text_rect)
+    
+    # Draw rotation indicator if auto-rotating
+    if auto_rotate and not taking_screenshot:
+        rotate_text = font_medium.render("Auto-rotating... Press T to toggle", True, LIGHT_GRAY)
+        rotate_rect = rotate_text.get_rect(center=(CENTER_X, CENTER_Y + 130))
+        screen.blit(rotate_text, rotate_rect)
 
 def draw_scan_data():
     if not scan_points:
@@ -613,12 +884,13 @@ def draw_ui():
         
         compact_data = [
             f"Status: {scan_status}",
-            f"Distance: {beam_distance:.0f}cm" if scan_active else "Distance: —",
-            f"Angle: {get_beam_angle(sensor['yaw_instant']):.0f}°" if scan_active and get_beam_angle(sensor['yaw_instant']) else "Angle: —",
+            f"Distance: {current_distance:.1f}cm" if scan_active else "Distance: —",
+            f"Angle: {get_beam_angle(sensor['yaw_instant']):.1f}°" if scan_active and get_beam_angle(sensor['yaw_instant']) else "Angle: —",
             f"Object: {sensor['object']}" if scan_active else "Object: —",
             f"Calibrated: {'YES' if calibrated else 'NO'}",
+            f"View: {'3D' if view_mode == VIEW_MODE_3D else '2D'}",
             "",
-            "R - Reset | C - Calibrate | S - Save PNG"
+            "R - Reset | C - Calibrate | V - Toggle View | S - Save PNG"
         ]
         
         for i, line in enumerate(compact_data):
@@ -630,6 +902,8 @@ def draw_ui():
                 color = GREEN
             elif "Calibrated: NO" in line:
                 color = RED
+            elif "View:" in line:
+                color = CYAN
             else:
                 color = WHITE
             
@@ -649,8 +923,8 @@ def draw_ui():
         panel_y = margin + PADDING_TOP
         
         available_height = HEIGHT - 2 * margin - 80
-        card_height = max(90, min(140, available_height // 4 - 10))
-        spacing = max(8, min(15, available_height // 25))
+        card_height = max(90, min(140, available_height // 5 - 10))
+        spacing = max(8, min(15, available_height // 30))
         
         if panel_x < WIDTH // 2 + 100:
             panel_width = max(200, WIDTH - (WIDTH // 2 + 100) - margin)
@@ -662,7 +936,7 @@ def draw_ui():
         
         status_content = [
             f"Status: {scan_status}",
-            f"Distance: {beam_distance:.1f} cm" if scan_active else "Distance: —",
+            f"Distance: {current_distance:.1f} cm" if scan_active else "Distance: —",
             f"Angle: {get_beam_angle(sensor['yaw_instant']):.1f}°" if scan_active and get_beam_angle(sensor['yaw_instant']) else "Angle: —",
             f"Object: {sensor['object']}" if scan_active else "Object: —"
         ]
@@ -681,32 +955,48 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y + card_height + spacing, panel_width, card_height,
                   "SYSTEM", system_content, calib_color)
         
+        # VIEW MODE PANEL
+        view_content = [
+            f"Mode: {'3D' if view_mode == VIEW_MODE_3D else '2D'}",
+            f"Auto-rotate: {'ON' if auto_rotate else 'OFF'}" if view_mode == VIEW_MODE_3D else "Perspective: Top-down",
+            " ",
+            "V: Toggle 2D/3D view" if scan_active else "Start scanning to access 3D"
+        ]
+        view_color = CYAN if scan_active else GRAY
+        draw_card(screen, panel_x, panel_y + 2*(card_height + spacing), panel_width, card_height,
+                  "VIEW MODE", view_content, view_color)
+        
         # CONTROLS
         controls_content = [
-            "Press R and C to start scanning",
-            " ",
-            "R: Resets scan and returns scanning position to center",
-            "C: Calibrates the sensor"
+            "R: Reset scan & center position",
+            "C: Calibrate sensor to 90°",
+            "V: Toggle 2D/3D view",
+            "T: Toggle auto-rotation (3D only)"
         ]
-        draw_card(screen, panel_x, panel_y + 2*(card_height + spacing), panel_width, card_height,
+        draw_card(screen, panel_x, panel_y + 3*(card_height + spacing), panel_width, card_height,
                   "CONTROLS", controls_content, BLUE)
         
         # EXPORT/SAVE PANEL
         export_content = [
-            "Press S to take and save a screenshot",
+            "Press S to save screenshot",
             " ",
-            "S: Saves current detected view to your Downloads",
-            "folder"
+            "S: Saves current view to Downloads",
+            "folder with timestamp"
         ]
-        draw_card(screen, panel_x, panel_y + 3*(card_height + spacing), panel_width, card_height,
+        draw_card(screen, panel_x, panel_y + 4*(card_height + spacing), panel_width, card_height,
                   "EXPORT/SAVE", export_content, PURPLE)
         
-        # TITLE AND RANGE
+        # TITLE AND INFO
         title = font_large.render("SurroundSense", True, WHITE)
         screen.blit(title, (20, 15 + PADDING_TOP))
         
         range_text = font_medium.render(f"MAX RANGE: {MAX_CM}cm", True, LIGHT_GRAY)
         screen.blit(range_text, (20, 45 + PADDING_TOP))
+        
+        # VIEW MODE INDICATOR UNDER MAX RANGE
+        view_mode_text = f"VIEW MODE: {'3D EXTRUDED' if view_mode == VIEW_MODE_3D else '2D RADAR'}"
+        view_text = font_medium.render(view_mode_text, True, CYAN)
+        screen.blit(view_text, (20, 70 + PADDING_TOP))
         
         return None, None, None
 
@@ -731,9 +1021,22 @@ while running:
             elif e.key == pygame.K_c:
                 yaw_offset = sensor["yaw_instant"] - 90.0
                 calibrated = True
+                # SEND CALIBRATION COMMAND TO ARDUINO
                 try:
                     ser.write(b"CALIB\n")
-                except: pass
+                    ser.flush()  # ENSURE COMMAND IS SENT IMMEDIATELY
+                except Exception as e:
+                    print(f"Failed to send calibration command: {e}")
+            elif e.key == pygame.K_v:
+                # TOGGLE VIEW MODE (ONLY WHEN SCANNING IS ACTIVE)
+                if scan_active:
+                    view_mode = VIEW_MODE_3D if view_mode == VIEW_MODE_2D else VIEW_MODE_2D
+                    print(f"Switched to {'3D' if view_mode == VIEW_MODE_3D else '2D'} view mode")
+            elif e.key == pygame.K_t:
+                # TOGGLE AUTO-ROTATION IN 3D MODE
+                if view_mode == VIEW_MODE_3D:
+                    auto_rotate = not auto_rotate
+                    print(f"Auto-rotation {'enabled' if auto_rotate else 'disabled'}")
             elif e.key == pygame.K_s:
                 save_screenshot()
             elif e.key == pygame.K_F11:
@@ -784,10 +1087,12 @@ while running:
             if line:
                 parsed = parse_line(line)
                 
+                # USE RAW DISTANCE DIRECTLY FOR ACCURACY
                 if "distance" in parsed:
                     raw_dist = float(parsed["distance"])
-                    sensor["distance_raw"] = movavg(map_dist_hist, raw_dist)
-                    beam_distance = raw_dist
+                    sensor["distance_raw"] = raw_dist
+                    current_distance = raw_dist  # STORE EXACT SENSOR READING
+                    beam_distance = raw_dist     # USE SAME RAW VALUE FOR BEAM
                 
                 if "yaw" in parsed:
                     raw_yaw = wrap360(float(parsed["yaw"]))
@@ -797,27 +1102,26 @@ while running:
                 if "direction" in parsed: sensor["direction"] = parsed["direction"]
                 if "object" in parsed: sensor["object"] = parsed["object"]
                 if "gyro" in parsed: sensor["gyro"] = parsed["gyro"]
-        except: pass
+        except Exception as e:
+            print(f"Serial read error: {e}")
 
     # CALCULATE ANGLES - ONLY WHEN SCANNING IS ACTIVE
     if scan_active:
         beam_angle = get_beam_angle(sensor["yaw_instant"])
         map_angle = get_map_angle(sensor["yaw_raw"])
-        
-        # CALCULATE DISTANCES
-        beam_plot_distance = clamp(beam_distance, 0.0, MAX_CM) if sensor["object"].lower() != "none" and beam_distance < MAX_CM else MAX_CM
-        distance_plot = clamp(sensor["distance_raw"], 0.0, MAX_CM) if sensor["object"].lower() != "none" and sensor["distance_raw"] < MAX_CM else MAX_CM
 
-        # UPDATE MAP
+        # UPDATE MAP WITH ACCURATE DISTANCE VALUES
         if map_angle is not None and 0 <= map_angle <= 180:
             angle_key = int(round(map_angle))
-            has_object = sensor["object"].lower() != "none" and sensor["distance_raw"] < MAX_CM
-            actual_distance = sensor["distance_raw"] if has_object else MAX_CM
+            has_object = sensor["object"].lower() != "none" and current_distance < MAX_CM
+            
+            # USE CLAMPED DISTANCE FOR DISPLAY BUT STORE RAW DISTANCE
+            display_distance = clamp(current_distance, 0.0, MAX_CM) if has_object else MAX_CM
             
             scan_points[angle_key] = {
-                'coord': polar_to_xy(angle_key, distance_plot),
+                'coord': polar_to_xy(angle_key, display_distance),
                 'has_object': has_object,
-                'distance': actual_distance
+                'distance': current_distance  # STORE RAW DISTANCE FOR ACCURACY
             }
     else:
         beam_angle = None
@@ -828,10 +1132,15 @@ while running:
     if not minimized:
         if scan_active:
             # DRAW ACTIVE SCANNING INTERFACE
-            draw_radar_display()
-            draw_scan_data()
-            if beam_angle is not None:
-                draw_beam(beam_angle, beam_plot_distance)
+            if view_mode == VIEW_MODE_2D:
+                draw_radar_display()
+                draw_scan_data()
+                if beam_angle is not None:
+                    # USE CLAMPED DISTANCE FOR BEAM DISPLAY
+                    beam_display_distance = clamp(beam_distance, 0.0, MAX_CM) if sensor["object"].lower() != "none" and beam_distance < MAX_CM else MAX_CM
+                    draw_beam(beam_angle, beam_display_distance)
+            else:  # 3D MODE
+                draw_3d_view()
         else:
             # DRAW IDLE SCREEN
             draw_idle_screen()
@@ -844,3 +1153,9 @@ while running:
 
 ser.close()
 pygame.quit()
+
+#CALIB COMMAND NOW PROPERLY SENT TO ARDUINO WITH ERROR HANDLING
+#ADDED 2D/3D VIEW MODE TOGGLE WITH 'V' KEY
+#3D MODE EXTRUDES THE SCANNED GREEN AREA AND RENDERS IT AS A 3D SURFACE
+#AUTO-ROTATION IN 3D MODE CAN BE TOGGLED WITH 'T' KEY
+#VIEW MODE INDICATOR ADDED UNDER MAX RANGE DISPLAY
