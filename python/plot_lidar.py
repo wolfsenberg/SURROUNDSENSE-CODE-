@@ -58,17 +58,25 @@ CYAN = (0, 255, 255)
 
 PADDING_TOP = 30
 
-# 3D RENDERING SETTINGS
+# 3D RENDERING SETTINGS - AUTOCAD STYLE
 VIEW_MODE_2D = 0
 VIEW_MODE_3D = 1
 view_mode = VIEW_MODE_2D
 
-# 3D Camera settings
-camera_angle_x = -30  # Tilt down to see the surface
-camera_angle_y = 0    # Rotation around Y axis
-camera_distance = 400 # Distance from center
-camera_height = 200   # Height above the scan plane
-auto_rotate = True    # Auto rotate in 3D mode
+# 3D Camera settings - AutoCAD style navigation
+camera_zoom = 1.0         # Zoom factor
+camera_rotation_x = -45   # X rotation (tilt)
+camera_rotation_y = 45    # Y rotation (spin)
+camera_pan_x = 0          # Pan X offset
+camera_pan_y = 0          # Pan Y offset
+
+# Mouse interaction state
+mouse_dragging = False
+last_mouse_pos = (0, 0)
+mouse_drag_mode = None    # 'rotate', 'pan', or None
+
+# Scanning control
+scan_paused = False       # Pause/resume scanning
 
 # ===== SERIAL =====
 PORT = find_arduino_port()
@@ -288,197 +296,222 @@ yaw_offset = 0.0
 scan_active = False  # SCANNING AND BEAM ONLY ACTIVE AFTER FIRST R PRESS
 scan_points = {}  # angle -> {'coord': (x,y), 'has_object': bool, 'distance': float}
 
-# ===== 3D MATH HELPERS =====
+# ===== AUTOCAD-STYLE 3D MATH HELPERS =====
 def rotate_point_3d(x, y, z, angle_x, angle_y, angle_z=0):
-    """Rotate a 3D point around all three axes"""
-    # Convert angles to radians
+    """Rotate a 3D point around all three axes (AutoCAD style)"""
     ax, ay, az = math.radians(angle_x), math.radians(angle_y), math.radians(angle_z)
     
-    # Rotation around X axis
+    # Rotation around X axis (tilt up/down)
     y1 = y * math.cos(ax) - z * math.sin(ax)
     z1 = y * math.sin(ax) + z * math.cos(ax)
     y, z = y1, z1
     
-    # Rotation around Y axis
+    # Rotation around Y axis (spin left/right)
     x1 = x * math.cos(ay) + z * math.sin(ay)
     z1 = -x * math.sin(ay) + z * math.cos(ay)
     x, z = x1, z1
     
-    # Rotation around Z axis
+    # Rotation around Z axis (roll)
     x1 = x * math.cos(az) - y * math.sin(az)
     y1 = x * math.sin(az) + y * math.cos(az)
     x, y = x1, y1
     
     return x, y, z
 
-def project_3d_to_2d(x, y, z, camera_distance=400):
-    """Project 3D point to 2D screen coordinates with perspective"""
-    if z + camera_distance <= 0:
-        return None, None
-    
+def project_3d_to_2d(x, y, z, zoom=1.0, pan_x=0, pan_y=0):
+    """Project 3D point to 2D screen coordinates with zoom and pan (AutoCAD style)"""
     CENTER_X, CENTER_Y = get_center()
     
-    # Perspective projection
-    scale_factor = camera_distance / (z + camera_distance)
-    screen_x = CENTER_X + x * scale_factor
-    screen_y = CENTER_Y - y * scale_factor  # Negative because screen Y increases downward
+    # Apply zoom, pan and perspective
+    screen_x = CENTER_X + (x * zoom) + pan_x
+    screen_y = CENTER_Y - (y * zoom) + pan_y  # Negative because screen Y increases downward
     
     return int(screen_x), int(screen_y)
 
-def generate_3d_surface_mesh():
-    """Generate 3D mesh from scan points for extruded surface"""
+def generate_extruded_mesh():
+    """Generate AutoCAD-style extruded mesh from scan points"""
     if not scan_points:
-        return []
+        return [], []
     
     vertices = []
-    triangles = []
+    lines = []  # Store lines instead of triangles for wireframe
     
-    # Create vertices for the scanned surface
+    # Extrusion parameters
+    extrusion_height = 60  # Height of extrusion
+    scale_factor = 2.0     # Scale for 3D view
+    
+    # Sort angles for proper connection
     angles = sorted(scan_points.keys())
-    extrusion_height = 50  # Height of extrusion in 3D space
     
-    # Base vertices (on the scan plane)
-    base_vertices = []
-    top_vertices = []
+    if len(angles) < 2:
+        return vertices, lines
+    
+    # Generate base and top vertices
+    base_points = []
+    top_points = []
     
     for angle in angles:
         data = scan_points[angle]
         if data['has_object']:
-            # Convert polar to cartesian (relative to center)
-            distance = data['distance'] * SCALE * 0.3  # Scale down for 3D
+            # Convert to 3D coordinates
+            distance = data['distance'] * scale_factor
             angle_rad = math.radians(angle)
             
             x = distance * math.cos(angle_rad)
-            z = distance * math.sin(angle_rad)  # Use Z as the depth axis
+            z = distance * math.sin(angle_rad)
             
-            # Base vertex (y = 0)
-            base_vertices.append((x, 0, z))
-            # Top vertex (y = extrusion_height)  
-            top_vertices.append((x, extrusion_height, z))
+            # Base point (y = 0)
+            base_point = (x, 0, z)
+            base_points.append(base_point)
+            vertices.append(base_point)
+            
+            # Top point (y = extrusion_height)
+            top_point = (x, extrusion_height, z)
+            top_points.append(top_point)
+            vertices.append(top_point)
     
-    # Add center points
-    center_base = (0, 0, 0)
-    center_top = (0, extrusion_height, 0)
+    # Generate lines for wireframe
+    num_points = len(base_points)
     
-    vertices = [center_base, center_top] + base_vertices + top_vertices
+    if num_points >= 2:
+        # Connect base points
+        for i in range(num_points):
+            next_i = (i + 1) % num_points
+            base_idx = i * 2
+            next_base_idx = next_i * 2
+            lines.append((base_idx, next_base_idx))
+        
+        # Connect top points
+        for i in range(num_points):
+            next_i = (i + 1) % num_points
+            top_idx = i * 2 + 1
+            next_top_idx = next_i * 2 + 1
+            lines.append((top_idx, next_top_idx))
+        
+        # Connect base to top (vertical lines)
+        for i in range(num_points):
+            base_idx = i * 2
+            top_idx = i * 2 + 1
+            lines.append((base_idx, top_idx))
     
-    # Generate triangles for the surface
-    if len(base_vertices) >= 2:
-        for i in range(len(base_vertices)):
-            next_i = (i + 1) % len(base_vertices)
-            
-            # Base triangle (center to edge)
-            triangles.append((0, 2 + i, 2 + next_i))
-            
-            # Top triangle (center to edge)  
-            triangles.append((1, 2 + len(base_vertices) + next_i, 2 + len(base_vertices) + i))
-            
-            # Side quad (split into two triangles)
-            base_current = 2 + i
-            base_next = 2 + next_i
-            top_current = 2 + len(base_vertices) + i
-            top_next = 2 + len(base_vertices) + next_i
-            
-            # First triangle of quad
-            triangles.append((base_current, base_next, top_current))
-            # Second triangle of quad
-            triangles.append((base_next, top_next, top_current))
-    
-    return vertices, triangles
+    return vertices, lines
 
-def draw_3d_wireframe(vertices, triangles):
-    """Draw 3D wireframe mesh"""
-    if not vertices or not triangles:
+def draw_3d_autocad_view():
+    """Draw AutoCAD-style 3D wireframe view"""
+    global camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
+    
+    # Generate mesh
+    vertices, lines = generate_extruded_mesh()
+    
+    if not vertices or not lines:
+        # Draw empty 3D space indicator
+        CENTER_X, CENTER_Y = get_center()
+        empty_text = font_large.render("3D VIEW - NO SCAN DATA", True, GRAY)
+        text_rect = empty_text.get_rect(center=(CENTER_X, CENTER_Y))
+        screen.blit(empty_text, text_rect)
         return
     
-    # Transform and project vertices
+    # Transform and project all vertices
     projected_vertices = []
     
     for x, y, z in vertices:
-        # Apply camera rotation and position
-        rx, ry, rz = rotate_point_3d(x, y, z, camera_angle_x, camera_angle_y)
+        # Apply 3D rotation
+        rx, ry, rz = rotate_point_3d(x, y, z, camera_rotation_x, camera_rotation_y)
         
-        # Project to 2D
-        screen_x, screen_y = project_3d_to_2d(rx, ry, rz - camera_distance)
-        
-        if screen_x is not None and screen_y is not None:
-            projected_vertices.append((screen_x, screen_y))
-        else:
-            projected_vertices.append(None)
+        # Project to 2D with zoom and pan
+        screen_x, screen_y = project_3d_to_2d(rx, ry, rz, camera_zoom, camera_pan_x, camera_pan_y)
+        projected_vertices.append((screen_x, screen_y))
     
-    # Draw triangles as wireframe
-    for triangle in triangles:
-        points = []
-        valid = True
+    # Draw wireframe lines
+    for line in lines:
+        start_idx, end_idx = line
         
-        for vertex_idx in triangle:
-            if vertex_idx < len(projected_vertices) and projected_vertices[vertex_idx] is not None:
-                points.append(projected_vertices[vertex_idx])
-            else:
-                valid = False
-                break
+        if start_idx < len(projected_vertices) and end_idx < len(projected_vertices):
+            start_pos = projected_vertices[start_idx]
+            end_pos = projected_vertices[end_idx]
+            
+            # Check if line is within reasonable screen bounds
+            if (-1000 <= start_pos[0] <= WIDTH + 1000 and -1000 <= start_pos[1] <= HEIGHT + 1000 and
+                -1000 <= end_pos[0] <= WIDTH + 1000 and -1000 <= end_pos[1] <= HEIGHT + 1000):
+                pygame.draw.line(screen, LIGHT_GREEN, start_pos, end_pos, 2)
+    
+    # Draw origin indicator
+    origin_3d = rotate_point_3d(0, 0, 0, camera_rotation_x, camera_rotation_y)
+    origin_2d = project_3d_to_2d(origin_3d[0], origin_3d[1], origin_3d[2], camera_zoom, camera_pan_x, camera_pan_y)
+    
+    if 0 <= origin_2d[0] < WIDTH and 0 <= origin_2d[1] < HEIGHT:
+        pygame.draw.circle(screen, RED, origin_2d, 8)
+        pygame.draw.circle(screen, WHITE, origin_2d, 6)
+    
+    # Draw 3D navigation help
+    if not taking_screenshot:
+        help_text = [
+            "3D NAVIGATION:",
+            "Left Mouse: Rotate view",
+            "Right Mouse: Pan view", 
+            "Mouse Wheel: Zoom in/out"
+        ]
         
-        if valid and len(points) == 3:
-            # Draw triangle edges
-            for i in range(3):
-                start_point = points[i]
-                end_point = points[(i + 1) % 3]
-                
-                # Check if points are within screen bounds
-                if (0 <= start_point[0] < WIDTH and 0 <= start_point[1] < HEIGHT and
-                    0 <= end_point[0] < WIDTH and 0 <= end_point[1] < HEIGHT):
-                    pygame.draw.line(screen, LIGHT_GREEN, start_point, end_point, 2)
+        y_offset = HEIGHT - 120
+        for i, text in enumerate(help_text):
+            color = CYAN if i == 0 else LIGHT_GRAY
+            help_surface = font_small.render(text, True, color)
+            screen.blit(help_surface, (20, y_offset + i * 18))
 
-def draw_3d_filled_surface(vertices, triangles):
-    """Draw 3D filled surface with depth sorting"""
-    if not vertices or not triangles:
-        return
+# ===== MOUSE INTERACTION HANDLERS =====
+def handle_mouse_wheel(event):
+    """Handle mouse wheel for zooming (AutoCAD style)"""
+    global camera_zoom
     
-    # Transform vertices and calculate depths
-    transformed_triangles = []
+    if view_mode == VIEW_MODE_3D:
+        zoom_factor = 1.1 if event.y > 0 else 0.9
+        camera_zoom = max(0.1, min(5.0, camera_zoom * zoom_factor))
+
+def handle_mouse_button_down(event):
+    """Handle mouse button press for starting drag operations"""
+    global mouse_dragging, last_mouse_pos, mouse_drag_mode
     
-    for triangle_idx, triangle in enumerate(triangles):
-        triangle_vertices = []
-        triangle_z_values = []
-        
-        for vertex_idx in triangle:
-            if vertex_idx < len(vertices):
-                x, y, z = vertices[vertex_idx]
-                
-                # Apply camera rotation
-                rx, ry, rz = rotate_point_3d(x, y, z, camera_angle_x, camera_angle_y)
-                
-                # Project to 2D
-                screen_x, screen_y = project_3d_to_2d(rx, ry, rz - camera_distance)
-                
-                if screen_x is not None and screen_y is not None:
-                    triangle_vertices.append((screen_x, screen_y))
-                    triangle_z_values.append(rz)
-                else:
-                    triangle_vertices = []
-                    break
-        
-        if len(triangle_vertices) == 3:
-            avg_z = sum(triangle_z_values) / 3
-            transformed_triangles.append((avg_z, triangle_vertices))
+    if view_mode == VIEW_MODE_3D:
+        if event.button == 1:  # Left mouse button - rotate
+            mouse_dragging = True
+            mouse_drag_mode = 'rotate'
+            last_mouse_pos = pygame.mouse.get_pos()
+        elif event.button == 3:  # Right mouse button - pan
+            mouse_dragging = True
+            mouse_drag_mode = 'pan'
+            last_mouse_pos = pygame.mouse.get_pos()
+
+def handle_mouse_button_up(event):
+    """Handle mouse button release"""
+    global mouse_dragging, mouse_drag_mode
     
-    # Sort triangles by depth (back to front)
-    transformed_triangles.sort(key=lambda x: x[0], reverse=True)
+    if event.button in [1, 3]:
+        mouse_dragging = False
+        mouse_drag_mode = None
+
+def handle_mouse_motion(event):
+    """Handle mouse motion for dragging operations (AutoCAD style)"""
+    global camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y, last_mouse_pos
     
-    # Draw triangles
-    for avg_z, triangle_vertices in transformed_triangles:
-        # Color based on depth and surface type
-        depth_factor = max(0.3, min(1.0, (avg_z + 200) / 400))
+    if view_mode == VIEW_MODE_3D and mouse_dragging:
+        mouse_x, mouse_y = pygame.mouse.get_pos()
+        dx = mouse_x - last_mouse_pos[0]
+        dy = mouse_y - last_mouse_pos[1]
         
-        # Use green tones for the extruded surface
-        color_intensity = int(150 * depth_factor)
-        surface_color = (0, color_intensity, int(color_intensity * 0.7))
+        if mouse_drag_mode == 'rotate':
+            # Rotate camera based on mouse movement
+            camera_rotation_y += dx * 0.5  # Horizontal movement rotates around Y axis
+            camera_rotation_x += dy * 0.5  # Vertical movement rotates around X axis
+            
+            # Clamp X rotation to reasonable bounds
+            camera_rotation_x = max(-90, min(90, camera_rotation_x))
+            
+        elif mouse_drag_mode == 'pan':
+            # Pan camera based on mouse movement
+            camera_pan_x += dx * 2
+            camera_pan_y += dy * 2
         
-        # Check if all vertices are on screen
-        if all(0 <= x < WIDTH and 0 <= y < HEIGHT for x, y in triangle_vertices):
-            pygame.draw.polygon(screen, surface_color, triangle_vertices)
-            # Draw outline
-            pygame.draw.polygon(screen, LIGHT_GREEN, triangle_vertices, 1)
+        last_mouse_pos = (mouse_x, mouse_y)
 
 # ===== HELPERS =====
 def clamp(v, lo, hi): return max(lo, min(hi, v))
@@ -561,10 +594,10 @@ def save_screenshot():
                 if view_mode == VIEW_MODE_2D:
                     draw_radar_display()
                     draw_scan_data()
-                    if beam_angle is not None:
+                    if beam_angle is not None and not scan_paused:
                         draw_beam(beam_angle, beam_distance)
                 else:
-                    draw_3d_view()
+                    draw_3d_autocad_view()
             else:
                 draw_idle_screen()
         draw_ui()
@@ -684,42 +717,14 @@ def draw_radar_display():
         screen.blit(label, label_rect)
         
     # SCANNING INSTRUCTION TEXT - HIDDEN DURING SCREENSHOT OR WHEN SCREENSHOT MESSAGE IS SHOWING
-    if scan_active and not screenshot_message and not taking_screenshot:
+    if scan_active and not screenshot_message and not taking_screenshot and not scan_paused:
         instruction_text = font_large.render("Rotate the sensor very slow", True, GRAY)
         text_rect = instruction_text.get_rect(center=(CENTER_X, CENTER_Y + 50))
         screen.blit(instruction_text, text_rect)
-
-def draw_3d_view():
-    """Draw the 3D extruded view of the scanned area"""
-    global camera_angle_y
-    
-    # Auto-rotate camera in 3D mode
-    if auto_rotate:
-        camera_angle_y += 0.5  # Slow rotation
-        if camera_angle_y >= 360:
-            camera_angle_y = 0
-    
-    # Generate 3D mesh from scan data
-    vertices, triangles = generate_3d_surface_mesh()
-    
-    if vertices and triangles:
-        # Draw filled surface
-        draw_3d_filled_surface(vertices, triangles)
-        
-        # Draw wireframe overlay for better definition
-        draw_3d_wireframe(vertices, triangles)
-    
-    # Draw 3D mode indicator
-    CENTER_X, CENTER_Y = get_center()
-    mode_text = font_large.render("3D VIEW - EXTRUDED SCAN DATA", True, CYAN)
-    text_rect = mode_text.get_rect(center=(CENTER_X, CENTER_Y + 100))
-    screen.blit(mode_text, text_rect)
-    
-    # Draw rotation indicator if auto-rotating
-    if auto_rotate and not taking_screenshot:
-        rotate_text = font_medium.render("Auto-rotating... Press T to toggle", True, LIGHT_GRAY)
-        rotate_rect = rotate_text.get_rect(center=(CENTER_X, CENTER_Y + 130))
-        screen.blit(rotate_text, rotate_rect)
+    elif scan_paused and not screenshot_message and not taking_screenshot:
+        paused_text = font_large.render("SCAN PAUSED - Press P to resume", True, ORANGE)
+        text_rect = paused_text.get_rect(center=(CENTER_X, CENTER_Y + 50))
+        screen.blit(paused_text, text_rect)
 
 def draw_scan_data():
     if not scan_points:
@@ -868,6 +873,8 @@ def draw_screenshot_message():
         screenshot_message = ""
 
 def draw_ui():
+    global camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
+    
     if minimized:
         # MINIMIZED UI - COMPACT DISPLAY
         pygame.draw.rect(screen, (40, 40, 40), (0, 0, MINI_WIDTH, 30), border_radius=8)
@@ -879,8 +886,8 @@ def draw_ui():
         pygame.draw.rect(screen, WHITE, (restore_btn.x + 8, restore_btn.y + 8, 9, 4))
         
         y_pos = 45
-        scan_status = "SCANNING" if scan_active else "IDLE"
-        scan_color = GREEN if scan_active else GRAY
+        scan_status = "PAUSED" if scan_paused else ("SCANNING" if scan_active else "IDLE")
+        scan_color = ORANGE if scan_paused else (GREEN if scan_active else GRAY)
         
         compact_data = [
             f"Status: {scan_status}",
@@ -890,7 +897,7 @@ def draw_ui():
             f"Calibrated: {'YES' if calibrated else 'NO'}",
             f"View: {'3D' if view_mode == VIEW_MODE_3D else '2D'}",
             "",
-            "R - Reset | C - Calibrate | V - Toggle View | S - Save PNG"
+            "R - Reset | C - Calibrate | V - Toggle View | P - Pause/Resume | S - Save PNG"
         ]
         
         for i, line in enumerate(compact_data):
@@ -923,16 +930,16 @@ def draw_ui():
         panel_y = margin + PADDING_TOP
         
         available_height = HEIGHT - 2 * margin - 80
-        card_height = max(90, min(140, available_height // 5 - 10))
-        spacing = max(8, min(15, available_height // 30))
+        card_height = max(80, min(120, available_height // 6 - 8))
+        spacing = max(6, min(12, available_height // 35))
         
         if panel_x < WIDTH // 2 + 100:
             panel_width = max(200, WIDTH - (WIDTH // 2 + 100) - margin)
             panel_x = WIDTH - panel_width - margin
         
         # STATUS PANEL
-        scan_status = "SCANNING" if scan_active else "IDLE"
-        scan_color = GREEN if scan_active else GRAY
+        scan_status = "PAUSED" if scan_paused else ("SCANNING" if scan_active else "IDLE")
+        scan_color = ORANGE if scan_paused else (GREEN if scan_active else GRAY)
         
         status_content = [
             f"Status: {scan_status}",
@@ -956,24 +963,43 @@ def draw_ui():
                   "SYSTEM", system_content, calib_color)
         
         # VIEW MODE PANEL
-        view_content = [
-            f"Mode: {'3D' if view_mode == VIEW_MODE_3D else '2D'}",
-            f"Auto-rotate: {'ON' if auto_rotate else 'OFF'}" if view_mode == VIEW_MODE_3D else "Perspective: Top-down",
-            " ",
-            "V: Toggle 2D/3D view" if scan_active else "Start scanning to access 3D"
-        ]
+        if view_mode == VIEW_MODE_3D:
+            view_content = [
+                f"Mode: 3D AutoCAD Style",
+                f"Zoom: {camera_zoom:.2f}x",
+                f"Rotation: {camera_rotation_x:.0f}°, {camera_rotation_y:.0f}°",
+                f"Pan: {camera_pan_x:.0f}, {camera_pan_y:.0f}"
+            ]
+        else:
+            view_content = [
+                f"Mode: 2D Radar",
+                "Perspective: Top-down",
+                " ",
+                "Switch to 3D for navigation"
+            ]
         view_color = CYAN if scan_active else GRAY
         draw_card(screen, panel_x, panel_y + 2*(card_height + spacing), panel_width, card_height,
                   "VIEW MODE", view_content, view_color)
+        
+        # SCAN CONTROL PANEL
+        control_content = [
+            f"Scanning: {'PAUSED' if scan_paused else 'ACTIVE'}" if scan_active else "Scanning: INACTIVE",
+            " ",
+            "P: Pause/Resume scanning",
+            "Pause to freeze view while navigating"
+        ]
+        control_color = ORANGE if scan_paused else (GREEN if scan_active else GRAY)
+        draw_card(screen, panel_x, panel_y + 3*(card_height + spacing), panel_width, card_height,
+                  "SCAN CONTROL", control_content, control_color)
         
         # CONTROLS
         controls_content = [
             "R: Reset scan & center position",
             "C: Calibrate sensor to 90°",
             "V: Toggle 2D/3D view",
-            "T: Toggle auto-rotation (3D only)"
+            "Mouse: Navigate in 3D mode"
         ]
-        draw_card(screen, panel_x, panel_y + 3*(card_height + spacing), panel_width, card_height,
+        draw_card(screen, panel_x, panel_y + 4*(card_height + spacing), panel_width, card_height,
                   "CONTROLS", controls_content, BLUE)
         
         # EXPORT/SAVE PANEL
@@ -983,7 +1009,7 @@ def draw_ui():
             "S: Saves current view to Downloads",
             "folder with timestamp"
         ]
-        draw_card(screen, panel_x, panel_y + 4*(card_height + spacing), panel_width, card_height,
+        draw_card(screen, panel_x, panel_y + 5*(card_height + spacing), panel_width, card_height,
                   "EXPORT/SAVE", export_content, PURPLE)
         
         # TITLE AND INFO
@@ -994,7 +1020,7 @@ def draw_ui():
         screen.blit(range_text, (20, 45 + PADDING_TOP))
         
         # VIEW MODE INDICATOR UNDER MAX RANGE
-        view_mode_text = f"VIEW MODE: {'3D EXTRUDED' if view_mode == VIEW_MODE_3D else '2D RADAR'}"
+        view_mode_text = f"VIEW MODE: {'3D AUTOCAD STYLE' if view_mode == VIEW_MODE_3D else '2D RADAR'}"
         view_text = font_medium.render(view_mode_text, True, CYAN)
         screen.blit(view_text, (20, 70 + PADDING_TOP))
         
@@ -1014,10 +1040,28 @@ while running:
                 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
                 screen.fill(BLACK)
                 pygame.display.flip()
+        elif e.type == pygame.MOUSEWHEEL:
+            handle_mouse_wheel(e)
+        elif e.type == pygame.MOUSEBUTTONDOWN:
+            if not minimized:
+                handle_mouse_button_down(e)
+        elif e.type == pygame.MOUSEBUTTONUP:
+            if not minimized:
+                handle_mouse_button_up(e)
+        elif e.type == pygame.MOUSEMOTION:
+            if not minimized:
+                handle_mouse_motion(e)
         elif e.type == pygame.KEYDOWN:
             if e.key == pygame.K_r:
                 scan_points.clear()
                 scan_active = True  # ENABLE SCANNING AND BEAM AFTER R PRESS
+                scan_paused = False  # RESET PAUSE STATE
+                # Reset 3D camera to default position
+                camera_zoom = 1.0
+                camera_rotation_x = -45
+                camera_rotation_y = 45
+                camera_pan_x = 0
+                camera_pan_y = 0
             elif e.key == pygame.K_c:
                 yaw_offset = sensor["yaw_instant"] - 90.0
                 calibrated = True
@@ -1027,16 +1071,16 @@ while running:
                     ser.flush()  # ENSURE COMMAND IS SENT IMMEDIATELY
                 except Exception as e:
                     print(f"Failed to send calibration command: {e}")
+            elif e.key == pygame.K_p:
+                # PAUSE/RESUME SCANNING
+                if scan_active:
+                    scan_paused = not scan_paused
+                    print(f"Scanning {'paused' if scan_paused else 'resumed'}")
             elif e.key == pygame.K_v:
                 # TOGGLE VIEW MODE (ONLY WHEN SCANNING IS ACTIVE)
                 if scan_active:
                     view_mode = VIEW_MODE_3D if view_mode == VIEW_MODE_2D else VIEW_MODE_2D
-                    print(f"Switched to {'3D' if view_mode == VIEW_MODE_3D else '2D'} view mode")
-            elif e.key == pygame.K_t:
-                # TOGGLE AUTO-ROTATION IN 3D MODE
-                if view_mode == VIEW_MODE_3D:
-                    auto_rotate = not auto_rotate
-                    print(f"Auto-rotation {'enabled' if auto_rotate else 'disabled'}")
+                    print(f"Switched to {'3D AutoCAD' if view_mode == VIEW_MODE_3D else '2D Radar'} view mode")
             elif e.key == pygame.K_s:
                 save_screenshot()
             elif e.key == pygame.K_F11:
@@ -1080,8 +1124,8 @@ while running:
                     screen.fill(BLACK)
                     pygame.display.flip()
 
-    # SERIAL READ - ONLY PROCESS DATA IF SCANNING IS ACTIVE
-    if ser.in_waiting and scan_active:
+    # SERIAL READ - ONLY PROCESS DATA IF SCANNING IS ACTIVE AND NOT PAUSED
+    if ser.in_waiting and scan_active and not scan_paused:
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             if line:
@@ -1105,8 +1149,8 @@ while running:
         except Exception as e:
             print(f"Serial read error: {e}")
 
-    # CALCULATE ANGLES - ONLY WHEN SCANNING IS ACTIVE
-    if scan_active:
+    # CALCULATE ANGLES - ONLY WHEN SCANNING IS ACTIVE AND NOT PAUSED
+    if scan_active and not scan_paused:
         beam_angle = get_beam_angle(sensor["yaw_instant"])
         map_angle = get_map_angle(sensor["yaw_raw"])
 
@@ -1124,7 +1168,7 @@ while running:
                 'distance': current_distance  # STORE RAW DISTANCE FOR ACCURACY
             }
     else:
-        beam_angle = None
+        beam_angle = get_beam_angle(sensor["yaw_instant"]) if scan_active else None
 
     # DRAW EVERYTHING
     screen.fill(BLACK)
@@ -1135,12 +1179,12 @@ while running:
             if view_mode == VIEW_MODE_2D:
                 draw_radar_display()
                 draw_scan_data()
-                if beam_angle is not None:
+                if beam_angle is not None and not scan_paused:
                     # USE CLAMPED DISTANCE FOR BEAM DISPLAY
                     beam_display_distance = clamp(beam_distance, 0.0, MAX_CM) if sensor["object"].lower() != "none" and beam_distance < MAX_CM else MAX_CM
                     draw_beam(beam_angle, beam_display_distance)
             else:  # 3D MODE
-                draw_3d_view()
+                draw_3d_autocad_view()
         else:
             # DRAW IDLE SCREEN
             draw_idle_screen()
@@ -1156,6 +1200,10 @@ pygame.quit()
 
 #CALIB COMMAND NOW PROPERLY SENT TO ARDUINO WITH ERROR HANDLING
 #ADDED 2D/3D VIEW MODE TOGGLE WITH 'V' KEY
-#3D MODE EXTRUDES THE SCANNED GREEN AREA AND RENDERS IT AS A 3D SURFACE
-#AUTO-ROTATION IN 3D MODE CAN BE TOGGLED WITH 'T' KEY
-#VIEW MODE INDICATOR ADDED UNDER MAX RANGE DISPLAY
+#3D MODE IS NOW AUTOCAD-STYLE WITH MOUSE NAVIGATION:
+#- LEFT MOUSE DRAG: ROTATE VIEW
+#- RIGHT MOUSE DRAG: PAN VIEW  
+#- MOUSE WHEEL: ZOOM IN/OUT
+#ADDED PAUSE/RESUME FUNCTIONALITY WITH 'P' KEY TO FREEZE SCAN DATA
+#3D VIEW SHOWS EXTRUDED WIREFRAME OF SCANNED AREA
+#RESET 'R' NOW ALSO RESETS 3D CAMERA TO DEFAULT POSITION
