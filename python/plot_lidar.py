@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import serial
 import serial.tools.list_ports
 import pygame
@@ -25,17 +26,35 @@ def find_arduino_port():
             continue
     return None
 
-def restart_app():
-    """RESTART THE APPLICATION"""
+def safe_restart():
+    """SAFER CROSS-PLATFORM APPLICATION RESTART"""
     try:
         pygame.quit()
-        if 'ser' in globals() and ser.is_open:
+        if 'ser' in globals() and hasattr(ser, 'is_open') and ser.is_open:
             ser.close()
     except:
         pass
     
-    python = sys.executable
-    os.execl(python, python, *sys.argv)
+    try:
+        if getattr(sys, 'frozen', False):
+            # RUNNING AS COMPILED EXECUTABLE
+            current_exe = sys.executable
+            os.startfile(current_exe) if os.name == 'nt' else subprocess.Popen([current_exe])
+        else:
+            # RUNNING AS PYTHON SCRIPT
+            python_exe = sys.executable
+            script_path = os.path.abspath(__file__)
+            if os.name == 'nt':
+                os.system(f'start "{python_exe}" "{script_path}"')
+            else:
+                subprocess.Popen([python_exe, script_path])
+        
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"Restart failed: {e}")
+        print("Please manually restart the application")
+        sys.exit(1)
 
 # CORE SETTINGS
 BAUD = 9600
@@ -96,8 +115,14 @@ if PORT is None:
     exit()
 
 print(f"Arduino found on {PORT}")
-ser = serial.Serial(PORT, BAUD, timeout=1)
-time.sleep(2)
+
+try:
+    ser = serial.Serial(PORT, BAUD, timeout=1)
+    time.sleep(2)
+except Exception as e:
+    print(f"Failed to connect to Arduino: {e}")
+    input("Press Enter to exit...")
+    exit()
 
 def resource_path(relative_path):
     try:
@@ -271,7 +296,6 @@ yaw_offset = 0.0
 scan_active = False
 scan_points = {}
 
-# 3D MATH HELPERS
 def rotate_point_3d(x, y, z, angle_x, angle_y, angle_z=0):
     """ROTATE A 3D POINT AROUND ALL THREE AXES"""
     ax, ay, az = math.radians(angle_x), math.radians(angle_y), math.radians(angle_z)
@@ -416,7 +440,6 @@ def draw_3d_wireframe_view():
             help_surface = font_medium.render(text, True, color)
             screen.blit(help_surface, (20, y_offset + i * 18))
 
-# MOUSE HANDLERS
 def handle_mouse_wheel(event):
     """HANDLE ZOOM WITH MOUSE WHEEL"""
     global camera_zoom
@@ -467,7 +490,6 @@ def handle_mouse_motion(event):
         
         last_mouse_pos = (mouse_x, mouse_y)
 
-# UTILITY FUNCTIONS
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 def movavg(buf, val): buf.append(val); return sum(buf)/len(buf)
 def wrap360(a):
@@ -525,12 +547,15 @@ def get_downloads_folder():
     """GET USER'S DOWNLOADS FOLDER PATH"""
     try:
         if os.name == 'nt':
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
-                              r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
-                downloads_path = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")[0]
-                if os.path.exists(downloads_path):
-                    return downloads_path
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
+                                  r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
+                    downloads_path = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")[0]
+                    if os.path.exists(downloads_path):
+                        return downloads_path
+            except ImportError:
+                pass
             
             downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
             if os.path.exists(downloads_path):
@@ -616,7 +641,6 @@ def draw_card(surface, x, y, w, h, title, content, title_color=WHITE, bg_color=(
 def draw_radar_display():
     CENTER_X, CENTER_Y = get_center()
     
-    # ARC BACKGROUND
     pygame.draw.arc(
         screen,
         (15, 15, 15),
@@ -631,7 +655,6 @@ def draw_radar_display():
         10
     )
 
-    # OUTER ARC BORDER
     pygame.draw.arc(
         screen,
         GRAY,
@@ -646,7 +669,6 @@ def draw_radar_display():
         2
     )
 
-    # RANGE RINGS
     for r in [10, 20, 30, 40, 50, 60]:
         pygame.draw.arc(
             screen,
@@ -657,27 +679,23 @@ def draw_radar_display():
             1
         )
 
-    # ANGLE LINES
     for angle in range(0, 181, 30):
         end_pos = polar_to_xy(angle, MAX_CM)
         color = LIGHT_GRAY if angle == 90 else DARK_GRAY
         width = 2 if angle == 90 else 1
         pygame.draw.line(screen, color, (CENTER_X, CENTER_Y), end_pos, width)
 
-    # RANGE LABELS
     for r in [10, 20, 30, 40, 50, 60, 70]:
         label_pos = polar_to_xy(90, r)
         label = font_small.render(f"{r}cm", True, LIGHT_GRAY)
         screen.blit(label, (label_pos[0] - 12, label_pos[1] - 8))
 
-    # ANGLE LABELS
     for angle in [0, 30, 60, 90, 120, 150, 180]:
         label_pos = polar_to_xy(angle, MAX_CM + 15)
         label = font_small.render(f"{angle}°", True, LIGHT_GRAY)
         label_rect = label.get_rect(center=label_pos)
         screen.blit(label, label_rect)
         
-    # SCANNING INSTRUCTIONS
     if scan_active and not screenshot_message and not taking_screenshot and not scan_paused:
         instruction_text = font_medium.render("ROTATE THE SENSOR VERY SLOW", True, LIGHT_GRAY)
         text_rect = instruction_text.get_rect(center=(CENTER_X, CENTER_Y + 35))
@@ -697,7 +715,6 @@ def draw_scan_data():
     if not scan_points:
         return
     
-    # DRAW CONTINUOUS DOTTED LINE CONNECTING SCAN POINTS
     all_angles = sorted(scan_points.keys())
     if len(all_angles) > 1:
         for i in range(len(all_angles) - 1):
@@ -738,17 +755,14 @@ def draw_beam(angle_deg, dist_cm):
     CENTER_X, CENTER_Y = get_center()
     end_point = polar_to_xy(angle_deg, dist_cm)
     
-    # BEAM LINE
     pygame.draw.line(screen, LIGHT_GREEN, (CENTER_X, CENTER_Y), end_point, 4)
     pygame.draw.line(screen, GREEN, (CENTER_X, CENTER_Y), end_point, 2)
     
-    # TARGET INDICATOR
     if sensor["object"].lower() != "none" and dist_cm < MAX_CM:
         pygame.draw.circle(screen, RED, end_point, 12)
         pygame.draw.circle(screen, WHITE, end_point, 12, 3)
         pygame.draw.circle(screen, RED, end_point, 6)
     
-    # CENTER SENSOR
     pygame.draw.circle(screen, WHITE, (CENTER_X, CENTER_Y), 8)
     pygame.draw.circle(screen, BLUE, (CENTER_X, CENTER_Y), 6)
 
@@ -885,7 +899,6 @@ def draw_ui():
             
         return restore_btn, None, None
     else:
-        # FULL UI WITH RESPONSIVE PANELS
         min_panel_width = 240
         max_panel_width = 320
         panel_width = max(min_panel_width, min(max_panel_width, WIDTH // 4))
@@ -902,7 +915,6 @@ def draw_ui():
             panel_width = max(200, WIDTH - (WIDTH // 2 + 100) - margin)
             panel_x = WIDTH - panel_width - margin
         
-        # STATUS PANEL
         scan_status = "PAUSED" if scan_paused else ("SCANNING" if scan_active else "IDLE")
         scan_color = ORANGE if scan_paused else (GREEN if scan_active else GRAY)
         
@@ -916,7 +928,6 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y, panel_width, card_height, 
                   "SENSOR STATUS", status_content, object_color)
         
-        # SYSTEM INFO
         system_content = [
             f"Calibrated: {'YES' if calibrated else 'NO'}",
             f"Direction: {sensor['direction']}" if scan_active else "Direction: —",
@@ -927,7 +938,6 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y + card_height + spacing, panel_width, card_height,
                   "SYSTEM", system_content, calib_color)
         
-        # VIEW MODE PANEL
         if view_mode == VIEW_MODE_3D:
             view_content = [
                 f"Mode: 3D Wireframe Style",
@@ -946,7 +956,6 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y + 2*(card_height + spacing), panel_width, card_height,
                   "VIEW MODE", view_content, view_color)
         
-        # SCAN CONTROL PANEL
         control_content = [
             f"Scanning: {'PAUSED' if scan_paused else 'ACTIVE'}" if scan_active else "Scanning: INACTIVE",
             " ",
@@ -957,7 +966,6 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y + 3*(card_height + spacing), panel_width, card_height,
                   "SCAN PAUSE/RESUME CONTROL", control_content, control_color)
         
-        # CONTROLS
         controls_content = [
             "R: Reset scan",
             "C: Calibrate sensor to 90°",
@@ -966,7 +974,6 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y + 4*(card_height + spacing), panel_width, card_height,
                   "SENSOR & VIEW CONTROLS", controls_content, BLUE)
         
-        # EXPORT/SAVE PANEL
         export_content = [
             "Press S to save screenshot",
             " ",
@@ -975,7 +982,6 @@ def draw_ui():
         draw_card(screen, panel_x, panel_y + 5*(card_height + spacing), panel_width, card_height,
                   "EXPORT/SAVE", export_content, PURPLE)
         
-        # TITLE AND INFO
         title = font_large.render("SurroundSense", True, WHITE)
         screen.blit(title, (20, 15 + PADDING_TOP))
         
@@ -991,7 +997,6 @@ def draw_ui():
 # MAIN LOOP
 running = True
 while running:
-    # EVENT HANDLING
     for e in pygame.event.get():
         if e.type == pygame.QUIT:
             running = False
@@ -1015,23 +1020,19 @@ while running:
                 handle_mouse_motion(e)
         elif e.type == pygame.KEYDOWN:
             if e.key == pygame.K_r:
-                # RESET SCAN - CLEAR ALL DATA AND START FRESH
                 scan_points.clear()
                 scan_active = True
                 scan_paused = False
                 map_yaw_hist.clear()
                 beam_yaw_hist.clear()
-                # RESET 3D CAMERA TO TOP VIEW
                 camera_zoom = 1.0
                 camera_rotation_x = -90
                 camera_rotation_y = 0
                 camera_pan_x = 0
                 camera_pan_y = 0
             elif e.key == pygame.K_c:
-                # CALIBRATE SENSOR TO 90 DEGREES
                 yaw_offset = sensor["yaw_instant"] - 90.0
                 calibrated = True
-                # CLEAR BUFFERS AND INITIALIZE WITH 90 DEGREE POSITION
                 map_yaw_hist.clear()
                 beam_yaw_hist.clear()
                 for _ in range(BEAM_SMOOTH_N):
@@ -1058,8 +1059,7 @@ while running:
             elif e.key == pygame.K_s:
                 save_screenshot()
             elif e.key == pygame.K_x:
-                # RESTART APPLICATION
-                restart_app()
+                safe_restart()
             elif e.key == pygame.K_F11:
                 fullscreen = not fullscreen
                 if fullscreen:
@@ -1101,7 +1101,6 @@ while running:
                     screen.fill(BLACK)
                     pygame.display.flip()
 
-    # SERIAL COMMUNICATION - ONLY WHEN SCANNING ACTIVE AND NOT PAUSED
     if ser.in_waiting and scan_active and not scan_paused:
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -1125,12 +1124,10 @@ while running:
         except Exception as e:
             print(f"Serial read error: {e}")
 
-    # ANGLE CALCULATIONS - ONLY WHEN SCANNING ACTIVE AND NOT PAUSED
     if scan_active and not scan_paused:
         beam_angle = get_beam_angle(sensor["yaw_instant"])
         map_angle = get_map_angle(sensor["yaw_raw"])
 
-        # UPDATE SCAN POINTS
         if map_angle is not None and 0 <= map_angle <= 180:
             angle_key = int(round(map_angle))
             has_object = sensor["object"].lower() != "none" and current_distance < MAX_CM
@@ -1145,7 +1142,6 @@ while running:
     else:
         beam_angle = get_beam_angle(sensor["yaw_instant"]) if scan_active else None
 
-    # RENDERING
     screen.fill(BLACK)
     
     if not minimized:
@@ -1167,5 +1163,8 @@ while running:
     pygame.display.flip()
     clock.tick(60)
 
-ser.close()
+try:
+    ser.close()
+except:
+    pass
 pygame.quit()
