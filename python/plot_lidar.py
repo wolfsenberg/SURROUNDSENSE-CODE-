@@ -29,49 +29,72 @@ def find_arduino_port():
         pass
     return None
 
-def restart_app():
-    """RESTART APPLICATION - SIMPLIFIED AND RELIABLE"""
+def reset_to_idle():
+    """RESET APPLICATION TO IDLE STATE"""
+    global scan_active, scan_paused, calibrated, scan_points, yaw_offset
+    global camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
+    global current_distance, beam_distance, beam_angle
+    
     try:
-        # CLEANUP RESOURCES FIRST
-        try:
-            pygame.quit()
-        except:
-            pass
+        scan_active = False
+        scan_paused = False
+        calibrated = False
+        scan_points.clear()
+        yaw_offset = 0.0
         
-        try:
-            if 'ser' in globals() and hasattr(ser, 'is_open') and ser.is_open:
-                ser.close()
-        except:
-            pass
+        camera_zoom = 1.0
+        camera_rotation_x = -90
+        camera_rotation_y = 0
+        camera_pan_x = 0
+        camera_pan_y = 0
         
-        # GET CURRENT EXECUTABLE PATH
-        if getattr(sys, 'frozen', False):
-            # RUNNING AS EXECUTABLE
-            executable_path = sys.executable
-        else:
-            # RUNNING AS PYTHON SCRIPT
-            executable_path = sys.executable
-            script_path = os.path.abspath(__file__)
+        current_distance = 0.0
+        beam_distance = 0.0
+        beam_angle = None
         
-        # START NEW PROCESS
-        if getattr(sys, 'frozen', False):
-            # EXECUTABLE MODE
-            subprocess.Popen([executable_path], 
-                           creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0,
-                           close_fds=True)
-        else:
-            # SCRIPT MODE
-            subprocess.Popen([executable_path, script_path], 
-                           close_fds=True)
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
         
-        # EXIT CURRENT PROCESS
-        os._exit(0)
+        sensor.update({
+            "distance_raw": 0.0,
+            "yaw_raw": 90.0,
+            "yaw_instant": 90.0,
+            "direction": "Stationary",
+            "object": "None",
+            "gyro": "Still",
+        })
         
     except Exception as e:
-        print(f"RESTART FAILED: {e}")
-        print("PLEASE MANUALLY RESTART THE APPLICATION")
-        time.sleep(3)
-        os._exit(1)
+        print(f"RESET ERROR: {e}")
+
+def safe_display_mode_change(new_size, flags=0):
+    """SAFELY CHANGE DISPLAY MODE TO PREVENT FLICKERING"""
+    global screen, WIDTH, HEIGHT, display_changing
+    
+    try:
+        display_changing = True
+        
+        # STORE CURRENT FRAME
+        current_surface = screen.copy()
+        
+        if flags == pygame.FULLSCREEN:
+            screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            WIDTH, HEIGHT = screen.get_size()
+        else:
+            screen = pygame.display.set_mode(new_size, flags)
+            WIDTH, HEIGHT = new_size
+        
+        # IMMEDIATE CLEAR WITH BLACK
+        screen.fill(BLACK)
+        pygame.display.flip()
+        
+        display_changing = False
+        return True
+        
+    except Exception as e:
+        print(f"DISPLAY MODE CHANGE ERROR: {e}")
+        display_changing = False
+        return False
 
 # CORE SETTINGS
 BAUD = 9600
@@ -123,6 +146,9 @@ mouse_drag_mode = None
 
 # SCANNING CONTROL
 scan_paused = False
+
+# DISPLAY STATE
+display_changing = False
 
 # SERIAL CONNECTION SETUP
 PORT = None
@@ -355,7 +381,6 @@ yaw_offset = 0.0
 scan_active = False
 scan_points = {}
 
-# 3D MATH HELPERS
 def rotate_point_3d(x, y, z, angle_x, angle_y, angle_z=0):
     """ROTATE 3D POINT AROUND ALL AXES"""
     try:
@@ -536,13 +561,11 @@ def draw_3d_wireframe_view():
                 pass
                 
     except Exception:
-        # FALLBACK DISPLAY
         CENTER_X, CENTER_Y = get_center()
         error_text = font_large.render("3D VIEW ERROR", True, RED)
         text_rect = error_text.get_rect(center=(CENTER_X, CENTER_Y))
         screen.blit(error_text, text_rect)
 
-# MOUSE HANDLERS
 def handle_mouse_wheel(event):
     """HANDLE ZOOM WITH MOUSE WHEEL"""
     global camera_zoom
@@ -560,11 +583,11 @@ def handle_mouse_button_down(event):
     
     try:
         if view_mode == VIEW_MODE_3D:
-            if event.button == 1:  # LEFT CLICK - ROTATE
+            if event.button == 1:
                 mouse_dragging = True
                 mouse_drag_mode = 'rotate'
                 last_mouse_pos = pygame.mouse.get_pos()
-            elif event.button == 3:  # RIGHT CLICK - PAN
+            elif event.button == 3:
                 mouse_dragging = True
                 mouse_drag_mode = 'pan'
                 last_mouse_pos = pygame.mouse.get_pos()
@@ -605,7 +628,6 @@ def handle_mouse_motion(event):
     except Exception:
         pass
 
-# UTILITY FUNCTIONS
 def clamp(v, lo, hi): 
     try:
         return max(lo, min(hi, v))
@@ -650,7 +672,9 @@ def get_beam_angle(yaw_raw):
         
         if 0.0 <= y <= 180.0:
             reversed_y = 180 - y
-            return movavg(beam_yaw_hist, reversed_y)
+            smoothed_angle = movavg(beam_yaw_hist, reversed_y)
+            # CLAMP ANGLE TO VALID RANGE
+            return max(0.0, min(180.0, smoothed_angle))
         
         return None
     except:
@@ -668,7 +692,9 @@ def get_map_angle(yaw_raw):
         
         if 0.0 <= y <= 180.0:
             reversed_y = 180 - y
-            return movavg(map_yaw_hist, reversed_y)
+            smoothed_angle = movavg(map_yaw_hist, reversed_y)
+            # CLAMP ANGLE TO VALID RANGE
+            return max(0.0, min(180.0, smoothed_angle))
         
         return None
     except:
@@ -845,14 +871,14 @@ def draw_radar_display():
             
         # SCANNING INSTRUCTIONS
         if scan_active and not screenshot_message and not taking_screenshot and not scan_paused:
-            instruction_text = font_medium.render("ROTATE THE SENSOR VERY SLOW", True, LIGHT_GRAY)
+            instruction_text = font_medium.render("ROTATE THE SENSOR VERY SLOW", True, WHITE)
             text_rect = instruction_text.get_rect(center=(CENTER_X, CENTER_Y + 35))
             screen.blit(instruction_text, text_rect)
-            instruction_text2 = font_medium.render("Ensure the area is well-lit and the sensor is calibrated (press C to calibrate)", True, LIGHT_GRAY)
+            instruction_text2 = font_medium.render("Ensure the area is well-lit and the sensor is calibrated (press C to calibrate)", True, WHITE)
             text_rect2 = instruction_text2.get_rect(center=(CENTER_X, CENTER_Y + 65))
             screen.blit(instruction_text2, text_rect2)
-            instruction_text3 = font_medium.render("If the app crashes, press X to restart", True, LIGHT_GRAY)
-            text_rect3 = instruction_text3.get_rect(center=(CENTER_X, CENTER_Y + 95))
+            instruction_text3 = font_medium.render("If the app freezes, press X to restart", True, WHITE)
+            text_rect3 = instruction_text3.get_rect(center=(CENTER_X, CENTER_Y + 90))
             screen.blit(instruction_text3, text_rect3)
         elif scan_paused and not screenshot_message and not taking_screenshot:
             paused_text = font_large.render("SCAN PAUSED - Press P to resume", True, ORANGE)
@@ -911,6 +937,10 @@ def draw_beam(angle_deg, dist_cm):
             return
         
         CENTER_X, CENTER_Y = get_center()
+        # ENSURE VALID ANGLE AND DISTANCE
+        angle_deg = max(0.0, min(180.0, angle_deg))
+        dist_cm = max(0.0, min(MAX_CM, dist_cm))
+        
         end_point = polar_to_xy(angle_deg, dist_cm)
         
         # BEAM LINE
@@ -950,9 +980,9 @@ def draw_idle_screen():
         
         pygame.draw.circle(screen, GRAY, (CENTER_X, CENTER_Y), 4)
         
-        idle_text1 = font_large.render("WELCOME TO SURROUNDSENSE", True, LIGHT_GRAY)
+        idle_text1 = font_large.render("WELCOME TO SURROUNDSENSE", True, WHITE)
         idle_text2 = font_small.render("BY GEINEL NIÑO DUNGAO", True, LIGHT_GRAY)
-        idle_text3 = font_medium.render("PRESS R AND C TO START SCANNING", True, LIGHT_GRAY)
+        idle_text3 = font_medium.render("PRESS R AND C TO START SCANNING", True, WHITE)
         
         text1_rect = idle_text1.get_rect(center=(CENTER_X, CENTER_Y - 50))
         text2_rect = idle_text2.get_rect(center=(CENTER_X, CENTER_Y - 20))
@@ -1041,12 +1071,12 @@ def draw_ui():
             compact_data = [
                 f"Status: {scan_status}",
                 f"Distance: {current_distance:.1f}cm" if scan_active else "Distance: —",
-                f"Angle: {get_beam_angle(sensor['yaw_instant']):.1f}°" if scan_active and get_beam_angle(sensor['yaw_instant']) else "Angle: —",
+                f"Angle: {beam_angle:.1f}°" if scan_active and beam_angle is not None else "Angle: —",
                 f"Object: {sensor['object']}" if scan_active else "Object: —",
                 f"Calibrated: {'YES' if calibrated else 'NO'}",
                 f"View: {'3D' if view_mode == VIEW_MODE_3D else '2D'}",
                 "",
-                "R - Reset | C - Calibrate | V - Toggle View | P - Pause/Resume | S - Save PNG | X - Restart"
+                "R - Reset | C - Calibrate | V - Toggle View | P - Pause/Resume | S - Save PNG | X - Back to Idle"
             ]
             
             for i, line in enumerate(compact_data):
@@ -1069,7 +1099,6 @@ def draw_ui():
                 
             return restore_btn, None, None
         else:
-            # FULL UI WITH RESPONSIVE PANELS
             min_panel_width = 240
             max_panel_width = 320
             panel_width = max(min_panel_width, min(max_panel_width, WIDTH // 4))
@@ -1093,7 +1122,7 @@ def draw_ui():
             status_content = [
                 f"Status: {scan_status}",
                 f"Distance: {current_distance:.1f} cm" if scan_active else "Distance: —",
-                f"Angle: {get_beam_angle(sensor['yaw_instant']):.1f}°" if scan_active and get_beam_angle(sensor['yaw_instant']) else "Angle: —",
+                f"Angle: {beam_angle:.1f}°" if scan_active and beam_angle is not None else "Angle: —",
                 f"Object: {sensor['object']}" if scan_active else "Object: —"
             ]
             object_color = RED if scan_active and sensor["object"].lower() != "none" else scan_color
@@ -1145,7 +1174,8 @@ def draw_ui():
             controls_content = [
                 "R: Reset scan",
                 "C: Calibrate sensor to 90°",
-                "V: Switch between 2D/3D view"
+                "V: Switch between 2D/3D view",
+                "X: Back to idle mode"
             ]
             draw_card(screen, panel_x, panel_y + 4*(card_height + spacing), panel_width, card_height,
                       "SENSOR & VIEW CONTROLS", controls_content, BLUE)
@@ -1154,7 +1184,7 @@ def draw_ui():
             export_content = [
                 "Press S to save screenshot",
                 " ",
-                "S: Saves current view to your Downloads file"
+                "S: Saves current view to Downloads"
             ]
             draw_card(screen, panel_x, panel_y + 5*(card_height + spacing), panel_width, card_height,
                       "EXPORT/SAVE", export_content, PURPLE)
@@ -1163,7 +1193,7 @@ def draw_ui():
             title = font_large.render("SurroundSense", True, WHITE)
             screen.blit(title, (20, 15 + PADDING_TOP))
             
-            range_text = font_medium.render(f"MAX RANGE: {MAX_CM}cm", True, LIGHT_GRAY)
+            range_text = font_medium.render(f"MAX RANGE: {MAX_CM}cm", True, WHITE)
             screen.blit(range_text, (20, 45 + PADDING_TOP))
             
             view_mode_text = f"VIEW MODE: {'3D WIREFRAME STYLE' if view_mode == VIEW_MODE_3D else '2D RADAR STYLE'}"
@@ -1187,12 +1217,10 @@ try:
                     if e.type == pygame.QUIT:
                         running = False
                     elif e.type == pygame.VIDEORESIZE:
-                        if not fullscreen and not minimized:
+                        if not fullscreen and not minimized and not display_changing:
                             WIDTH = max(MIN_WIDTH, e.w)
                             HEIGHT = max(MIN_HEIGHT, e.h)
                             screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-                            screen.fill(BLACK)
-                            pygame.display.flip()
                     elif e.type == pygame.MOUSEWHEEL:
                         handle_mouse_wheel(e)
                     elif e.type == pygame.MOUSEBUTTONDOWN:
@@ -1200,13 +1228,7 @@ try:
                             restore_btn, _, _ = draw_ui()
                             if restore_btn and restore_btn.collidepoint(e.pos):
                                 minimized = False
-                                screen.fill(BLACK)
-                                pygame.display.flip()
-                                pygame.time.wait(10)
-                                screen = pygame.display.set_mode((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
-                                WIDTH, HEIGHT = DEFAULT_WIDTH, DEFAULT_HEIGHT
-                                screen.fill(BLACK)
-                                pygame.display.flip()
+                                safe_display_mode_change((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
                         else:
                             handle_mouse_button_down(e)
                     elif e.type == pygame.MOUSEBUTTONUP:
@@ -1217,7 +1239,6 @@ try:
                             handle_mouse_motion(e)
                     elif e.type == pygame.KEYDOWN:
                         if e.key == pygame.K_r:
-                            # RESET SCAN
                             scan_points.clear()
                             scan_active = True
                             scan_paused = False
@@ -1229,11 +1250,11 @@ try:
                             camera_pan_x = 0
                             camera_pan_y = 0
                         elif e.key == pygame.K_c:
-                            # CALIBRATE SENSOR TO 90 DEGREES
                             yaw_offset = sensor["yaw_instant"] - 90.0
                             calibrated = True
                             map_yaw_hist.clear()
                             beam_yaw_hist.clear()
+                            # INITIALIZE HISTORY BUFFERS WITH VALID VALUES
                             for _ in range(BEAM_SMOOTH_N):
                                 beam_yaw_hist.append(90.0)
                             for _ in range(MAP_SMOOTH_N):
@@ -1258,38 +1279,24 @@ try:
                         elif e.key == pygame.K_s:
                             save_screenshot()
                         elif e.key == pygame.K_x:
-                            # RESTART APPLICATION
-                            restart_app()
+                            reset_to_idle()
                         elif e.key == pygame.K_F11:
                             fullscreen = not fullscreen
                             if fullscreen:
-                                screen.fill(BLACK)
-                                pygame.display.flip()
-                                pygame.time.wait(10)
-                                screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-                                WIDTH, HEIGHT = screen.get_size()
-                                screen.fill(BLACK)
-                                pygame.display.flip()
+                                safe_display_mode_change((0, 0), pygame.FULLSCREEN)
                             else:
-                                screen.fill(BLACK)
-                                pygame.display.flip()
-                                pygame.time.wait(10)
-                                screen = pygame.display.set_mode((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
-                                WIDTH, HEIGHT = DEFAULT_WIDTH, DEFAULT_HEIGHT
-                                screen.fill(BLACK)
-                                pygame.display.flip()
+                                safe_display_mode_change((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
                         elif e.key == pygame.K_ESCAPE:
                             if fullscreen:
                                 fullscreen = False
-                                screen.fill(BLACK)
-                                pygame.display.flip()
-                                pygame.time.wait(10)
-                                screen = pygame.display.set_mode((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
-                                WIDTH, HEIGHT = DEFAULT_WIDTH, DEFAULT_HEIGHT
-                                screen.fill(BLACK)
-                                pygame.display.flip()
+                                safe_display_mode_change((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
                 except Exception:
                     continue
+
+            # SKIP PROCESSING DURING DISPLAY CHANGES
+            if display_changing:
+                clock.tick(30)
+                continue
 
             # SERIAL COMMUNICATION
             if ser and ser.in_waiting and scan_active and not scan_paused:
@@ -1321,10 +1328,14 @@ try:
                 except Exception:
                     pass
 
-            # ANGLE CALCULATIONS
+            # ANGLE CALCULATIONS AND BEAM UPDATE
             if scan_active and not scan_paused:
                 try:
-                    beam_angle = get_beam_angle(sensor["yaw_instant"])
+                    # CALCULATE BEAM ANGLE WITH CONTINUOUS UPDATE
+                    new_beam_angle = get_beam_angle(sensor["yaw_instant"])
+                    if new_beam_angle is not None:
+                        beam_angle = new_beam_angle
+                    
                     map_angle = get_map_angle(sensor["yaw_raw"])
 
                     # UPDATE SCAN POINTS
@@ -1341,11 +1352,6 @@ try:
                         }
                 except Exception:
                     pass
-            else:
-                try:
-                    beam_angle = get_beam_angle(sensor["yaw_instant"]) if scan_active else None
-                except Exception:
-                    beam_angle = None
 
             # RENDERING
             try:
@@ -1370,18 +1376,16 @@ try:
                 pygame.display.flip()
                 clock.tick(60)
             except Exception:
-                # FALLBACK RENDERING
                 screen.fill(BLACK)
-                error_text = font_large.render("RENDERING ERROR - PRESS X TO RESTART", True, RED)
+                error_text = font_large.render("RENDERING ERROR - PRESS X TO GO BACK TO IDLE", True, RED)
                 screen.blit(error_text, (50, HEIGHT // 2))
                 pygame.display.flip()
                 clock.tick(60)
                 
         except Exception:
-            # CRITICAL ERROR HANDLING
             try:
                 screen.fill(BLACK)
-                critical_text = font_large.render("CRITICAL ERROR - PRESS X TO RESTART", True, RED)
+                critical_text = font_large.render("CRITICAL ERROR - PRESS X TO GO BACK TO IDLE", True, RED)
                 screen.blit(critical_text, (50, HEIGHT // 2))
                 pygame.display.flip()
                 clock.tick(10)
@@ -1389,11 +1393,9 @@ try:
                 pass
 
 except Exception:
-    # FINAL EXCEPTION HANDLER
     print("FATAL ERROR OCCURRED")
 
 finally:
-    # CLEANUP
     try:
         if ser and ser.is_open:
             ser.close()
