@@ -7,6 +7,7 @@ import time
 import math
 from collections import deque
 from datetime import datetime
+import numpy as np
 
 def find_arduino_port():
     """AUTO-DETECT ARDUINO COM PORT"""
@@ -33,79 +34,85 @@ def reset_to_idle():
     
     print("EXECUTING COMPLETE SYSTEM RESET...")
     
-    # RESET ALL STATE VARIABLES
-    scan_active = False
-    scan_paused = False
-    calibrated = False
-    yaw_offset = 0.0
-    current_distance = 0.0
-    beam_distance = 0.0
-    
-    # CLEAR ALL DATA STRUCTURES
-    scan_points.clear()
-    map_yaw_hist.clear()
-    beam_yaw_hist.clear()
-    distance_filter.clear()
-    
-    # RESET SENSOR DATA TO DEFAULTS
-    sensor.update({
-        "distance_raw": 0.0,
-        "yaw_raw": 90.0,
-        "yaw_instant": 90.0,
-        "direction": "Stationary",
-        "object": "None",
-        "gyro": "Still",
-    })
-    
-    # RESET CAMERA SETTINGS
-    camera_zoom = 1.0
-    camera_rotation_x = -90
-    camera_rotation_y = 0
-    camera_pan_x = 0
-    camera_pan_y = 0
-    view_mode = VIEW_MODE_2D
-    
-    # RESET UI MESSAGES
-    screenshot_message = ""
-    screenshot_timer = 0
-    taking_screenshot = False
-    
-    # RESTART SERIAL CONNECTION TO FIX FROZEN COMMUNICATION
     try:
-        if ser and ser.is_open:
-            print("CLOSING EXISTING SERIAL CONNECTION...")
-            ser.close()
-            time.sleep(0.5)  # WAIT FOR CLEAN CLOSURE
+        # RESET ALL STATE VARIABLES
+        scan_active = False
+        scan_paused = False
+        calibrated = False
+        yaw_offset = 0.0
+        current_distance = 0.0
+        beam_distance = 0.0
+        
+        # CLEAR ALL DATA STRUCTURES
+        scan_points.clear()
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
+        distance_filter.clear()
+        angle_stability_buffer.clear()
+        corner_detection_buffer.clear()
+        
+        # RESET SENSOR DATA TO DEFAULTS
+        sensor.update({
+            "distance_raw": 0.0,
+            "yaw_raw": 90.0,
+            "yaw_instant": 90.0,
+            "direction": "Stationary",
+            "object": "None",
+            "gyro": "Still",
+        })
+        
+        # RESET CAMERA SETTINGS
+        camera_zoom = 1.0
+        camera_rotation_x = -90
+        camera_rotation_y = 0
+        camera_pan_x = 0
+        camera_pan_y = 0
+        view_mode = VIEW_MODE_2D
+        
+        # RESET UI MESSAGES
+        screenshot_message = ""
+        screenshot_timer = 0
+        taking_screenshot = False
+        
+        # RESTART SERIAL CONNECTION TO FIX FROZEN COMMUNICATION
+        try:
+            if ser and ser.is_open:
+                print("CLOSING EXISTING SERIAL CONNECTION...")
+                ser.close()
+                time.sleep(0.5)  # WAIT FOR CLEAN CLOSURE
+        except Exception as e:
+            print(f"Error closing serial connection: {e}")
+        
+        # REESTABLISH SERIAL CONNECTION
+        try:
+            print("REESTABLISHING SERIAL CONNECTION...")
+            PORT = find_arduino_port()
+            if PORT:
+                ser = serial.Serial(PORT, BAUD, timeout=1)
+                time.sleep(2)  # ARDUINO RESET TIME
+                
+                # FLUSH ANY EXISTING DATA IN BUFFERS
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                
+                # SEND RESET COMMAND TO ARDUINO
+                ser.write(b"RESET\n")
+                ser.flush()
+                print(f"SERIAL CONNECTION RESET ON {PORT}")
+            else:
+                print("WARNING: COULD NOT FIND ARDUINO PORT DURING RESET")
+        except Exception as e:
+            print(f"FAILED TO RESTART SERIAL CONNECTION: {e}")
+        
+        print("SYSTEM RESET COMPLETE - READY FOR NEW SCAN")
+        
     except Exception as e:
-        print(f"Error closing serial connection: {e}")
-    
-    # REESTABLISH SERIAL CONNECTION
-    try:
-        print("REESTABLISHING SERIAL CONNECTION...")
-        PORT = find_arduino_port()
-        if PORT:
-            ser = serial.Serial(PORT, BAUD, timeout=1)
-            time.sleep(2)  # ARDUINO RESET TIME
-            
-            # FLUSH ANY EXISTING DATA IN BUFFERS
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            
-            # SEND RESET COMMAND TO ARDUINO
-            ser.write(b"RESET\n")
-            ser.flush()
-            print(f"SERIAL CONNECTION RESET ON {PORT}")
-        else:
-            print("WARNING: COULD NOT FIND ARDUINO PORT DURING RESET")
-    except Exception as e:
-        print(f"FAILED TO RESTART SERIAL CONNECTION: {e}")
-    
-    print("SYSTEM RESET COMPLETE - READY FOR NEW SCAN")
+        print(f"ERROR DURING RESET: {e}")
 
 # CORE SETTINGS
 BAUD = 9600
-DEFAULT_WIDTH, DEFAULT_HEIGHT = 1380, 720
-MIN_WIDTH, MIN_HEIGHT = 1380, 720
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 1380, 716
+MIN_WIDTH, MIN_HEIGHT = 1380, 716
 WIDTH, HEIGHT = DEFAULT_WIDTH, DEFAULT_HEIGHT
 
 def get_center():
@@ -113,11 +120,26 @@ def get_center():
 
 MAX_CM = 70
 SCALE = 5
-MAP_SMOOTH_N = 5
-BEAM_SMOOTH_N = 3
 
-DISTANCE_FILTER_N = 3
+# ENHANCED FILTERING PARAMETERS FOR STABILITY
+MAP_SMOOTH_N = 7  # INCREASED FOR SMOOTHER MAP UPDATES
+BEAM_SMOOTH_N = 5  # INCREASED FOR BEAM STABILITY
+DISTANCE_FILTER_N = 5  # INCREASED DISTANCE FILTERING
+ANGLE_STABILITY_N = 8  # NEW: ANGLE STABILITY BUFFER
+CORNER_DETECTION_N = 12  # NEW: CORNER DETECTION BUFFER
+
 distance_filter = deque(maxlen=DISTANCE_FILTER_N)
+angle_stability_buffer = deque(maxlen=ANGLE_STABILITY_N)  # NEW: FOR ANGLE STABILITY
+corner_detection_buffer = deque(maxlen=CORNER_DETECTION_N)  # NEW: FOR CORNER DETECTION
+
+# ENHANCED FILTERING THRESHOLDS
+DISTANCE_CHANGE_THRESHOLD = 8.0  # MINIMUM DISTANCE CHANGE TO REGISTER
+ANGLE_STABILITY_THRESHOLD = 2.5  # ANGLE VARIATION THRESHOLD FOR STABILITY
+CORNER_DETECTION_THRESHOLD = 15.0  # DISTANCE CHANGE THRESHOLD FOR CORNER DETECTION
+
+# KEY DEBOUNCING VARIABLES
+last_key_times = {}
+KEY_DEBOUNCE_DELAY = 200  # MILLISECONDS BETWEEN KEY PRESSES
 
 # COLORS
 BLACK = (0, 0, 0)
@@ -407,13 +429,187 @@ yaw_offset = 0.0
 scan_active = False
 scan_points = {}
 
-def filter_distance(raw_distance):
-    """FILTER DISTANCE READINGS FOR ACCURACY"""
-    clamped_distance = min(raw_distance, MAX_CM)
-    distance_filter.append(clamped_distance)
-    sorted_distances = sorted(distance_filter)
-    median_idx = len(sorted_distances) // 2
-    return sorted_distances[median_idx]
+def is_key_debounced(key):
+    """CHECK IF ENOUGH TIME HAS PASSED SINCE LAST KEY PRESS"""
+    current_time = pygame.time.get_ticks()
+    if key in last_key_times:
+        if current_time - last_key_times[key] < KEY_DEBOUNCE_DELAY:
+            return False
+    last_key_times[key] = current_time
+    return True
+
+def safe_reset_scan():
+    """SAFELY RESET SCAN WITH ERROR HANDLING"""
+    try:
+        global scan_active, scan_paused, camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
+        
+        scan_points.clear()
+        scan_active = True
+        scan_paused = False
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
+        distance_filter.clear()
+        angle_stability_buffer.clear()
+        corner_detection_buffer.clear()
+        camera_zoom = 1.0
+        camera_rotation_x = -90
+        camera_rotation_y = 0
+        camera_pan_x = 0
+        camera_pan_y = 0
+        
+        print("SCAN RESET SUCCESSFUL")
+        
+    except Exception as e:
+        print(f"ERROR DURING SCAN RESET: {e}")
+
+def safe_calibrate_sensor():
+    """SAFELY CALIBRATE SENSOR WITH ERROR HANDLING"""
+    try:
+        global yaw_offset, calibrated
+        
+        yaw_offset = sensor["yaw_instant"] - 90.0
+        calibrated = True
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
+        distance_filter.clear()
+        angle_stability_buffer.clear()
+        corner_detection_buffer.clear()
+        
+        for _ in range(BEAM_SMOOTH_N):
+            beam_yaw_hist.append(90.0)
+        for _ in range(MAP_SMOOTH_N):
+            map_yaw_hist.append(90.0)
+        for _ in range(ANGLE_STABILITY_N):
+            angle_stability_buffer.append(90.0)
+        
+        try:
+            if ser and ser.is_open:
+                ser.write(b"CALIB\n")
+                ser.flush()
+                print("CALIBRATION COMMAND SENT TO ARDUINO")
+        except Exception as serial_error:
+            print(f"SERIAL COMMUNICATION ERROR DURING CALIBRATION: {serial_error}")
+        
+        print("SENSOR CALIBRATION SUCCESSFUL")
+        
+    except Exception as e:
+        print(f"ERROR DURING SENSOR CALIBRATION: {e}")
+
+def advanced_distance_filter(raw_distance):
+    """ENHANCED DISTANCE FILTERING WITH OUTLIER REJECTION AND STABILITY CHECKS"""
+    try:
+        # CLAMP TO MAX RANGE
+        clamped_distance = min(raw_distance, MAX_CM)
+        
+        # ADD TO FILTER BUFFER
+        distance_filter.append(clamped_distance)
+        
+        if len(distance_filter) < 3:
+            return clamped_distance
+        
+        # CONVERT TO LIST FOR STATISTICAL ANALYSIS
+        distances = list(distance_filter)
+        
+        # CALCULATE STATISTICAL MEASURES
+        mean_dist = sum(distances) / len(distances)
+        sorted_distances = sorted(distances)
+        median_dist = sorted_distances[len(sorted_distances) // 2]
+        
+        # OUTLIER DETECTION USING INTERQUARTILE RANGE
+        if len(distances) >= 4:
+            q1_idx = len(sorted_distances) // 4
+            q3_idx = 3 * len(sorted_distances) // 4
+            q1 = sorted_distances[q1_idx]
+            q3 = sorted_distances[q3_idx]
+            iqr = q3 - q1
+            
+            # REMOVE OUTLIERS THAT ARE TOO FAR FROM THE MEDIAN
+            outlier_threshold = 1.5 * iqr
+            filtered_distances = [d for d in distances if abs(d - median_dist) <= outlier_threshold + 5.0]
+            
+            if filtered_distances:
+                # USE WEIGHTED AVERAGE FAVORING RECENT READINGS
+                weights = [i + 1 for i in range(len(filtered_distances))]
+                weighted_avg = sum(d * w for d, w in zip(filtered_distances, weights)) / sum(weights)
+                return weighted_avg
+        
+        # FALLBACK TO MEDIAN FOR STABILITY
+        return median_dist
+        
+    except Exception as e:
+        print(f"ERROR IN ENHANCED DISTANCE FILTERING: {e}")
+        return raw_distance
+
+def enhanced_angle_stability_check(raw_angle):
+    """CHECK ANGLE STABILITY TO REDUCE FLUCTUATIONS"""
+    try:
+        angle_stability_buffer.append(raw_angle)
+        
+        if len(angle_stability_buffer) < 3:
+            return raw_angle
+        
+        angles = list(angle_stability_buffer)
+        
+        # CALCULATE ANGLE VARIATION (HANDLING CIRCULAR NATURE OF ANGLES)
+        angle_diffs = []
+        for i in range(1, len(angles)):
+            diff = abs(angles[i] - angles[i-1])
+            # HANDLE CIRCULAR WRAP-AROUND
+            if diff > 180:
+                diff = 360 - diff
+            angle_diffs.append(diff)
+        
+        avg_variation = sum(angle_diffs) / len(angle_diffs)
+        
+        # IF VARIATION IS TOO HIGH, USE SMOOTHED VALUE
+        if avg_variation > ANGLE_STABILITY_THRESHOLD:
+            # APPLY WEIGHTED SMOOTHING
+            weights = [i + 1 for i in range(len(angles))]
+            weighted_sum = 0
+            weight_total = 0
+            
+            for angle, weight in zip(angles, weights):
+                weighted_sum += angle * weight
+                weight_total += weight
+            
+            return weighted_sum / weight_total
+        
+        return raw_angle
+        
+    except Exception as e:
+        print(f"ERROR IN ANGLE STABILITY CHECK: {e}")
+        return raw_angle
+
+def detect_corner_and_optimize(angle, distance):
+    """ENHANCED CORNER DETECTION FOR ACCURATE SCANNING"""
+    try:
+        corner_detection_buffer.append((angle, distance))
+        
+        if len(corner_detection_buffer) < 6:
+            return False
+        
+        # ANALYZE RECENT DISTANCE CHANGES TO DETECT CORNERS
+        recent_data = list(corner_detection_buffer)[-6:]
+        distances = [data[1] for data in recent_data]
+        
+        # CALCULATE DISTANCE DERIVATIVES TO FIND SHARP CHANGES
+        distance_changes = []
+        for i in range(1, len(distances)):
+            change = abs(distances[i] - distances[i-1])
+            distance_changes.append(change)
+        
+        # CHECK FOR SIGNIFICANT DISTANCE CHANGES INDICATING CORNERS
+        max_change = max(distance_changes) if distance_changes else 0
+        avg_change = sum(distance_changes) / len(distance_changes) if distance_changes else 0
+        
+        # CORNER DETECTED IF THERE'S A SIGNIFICANT SUDDEN CHANGE
+        is_corner = max_change > CORNER_DETECTION_THRESHOLD and max_change > avg_change * 2.5
+        
+        return is_corner
+        
+    except Exception as e:
+        print(f"ERROR IN CORNER DETECTION: {e}")
+        return False
 
 def rotate_point_3d(x, y, z, angle_x, angle_y, angle_z=0):
     """ROTATE A 3D POINT AROUND ALL THREE AXES"""
@@ -607,6 +803,22 @@ def movavg(buf, val):
     buf.append(val)
     return sum(buf)/len(buf)
 
+def enhanced_moving_average(buf, val):
+    """ENHANCED MOVING AVERAGE WITH STABILITY WEIGHTING"""
+    buf.append(val)
+    if len(buf) <= 1:
+        return val
+    
+    # APPLY WEIGHTED AVERAGE FAVORING RECENT VALUES BUT MAINTAINING STABILITY
+    values = list(buf)
+    weights = [i + 1 for i in range(len(values))]
+    
+    # CALCULATE WEIGHTED AVERAGE
+    weighted_sum = sum(v * w for v, w in zip(values, weights))
+    weight_total = sum(weights)
+    
+    return weighted_sum / weight_total
+
 def wrap360(a):
     while a < 0: a += 360
     while a >= 360: a -= 360
@@ -621,9 +833,9 @@ def parse_line(line):
     return out
 
 def get_beam_angle(yaw_raw):
-    """CALCULATE BEAM ANGLE WITH PROPER CALIBRATION"""
+    """CALCULATE BEAM ANGLE WITH ENHANCED CALIBRATION AND STABILITY"""
     if not calibrated:
-        return movavg(beam_yaw_hist, 90.0)
+        return enhanced_moving_average(beam_yaw_hist, 90.0)
     else:
         y = yaw_raw - yaw_offset
     
@@ -631,14 +843,16 @@ def get_beam_angle(yaw_raw):
     
     if 0.0 <= y <= 180.0:
         reversed_y = 180 - y
-        return movavg(beam_yaw_hist, reversed_y)
+        # APPLY ANGLE STABILITY CHECK BEFORE AVERAGING
+        stable_angle = enhanced_angle_stability_check(reversed_y)
+        return enhanced_moving_average(beam_yaw_hist, stable_angle)
     
     return None
 
 def get_map_angle(yaw_raw):
-    """CALCULATE MAP ANGLE WITH PROPER CALIBRATION"""
+    """CALCULATE MAP ANGLE WITH ENHANCED CALIBRATION AND STABILITY"""
     if not calibrated:
-        return movavg(map_yaw_hist, 90.0)
+        return enhanced_moving_average(map_yaw_hist, 90.0)
     else:
         y = yaw_raw - yaw_offset
     
@@ -646,7 +860,9 @@ def get_map_angle(yaw_raw):
     
     if 0.0 <= y <= 180.0:
         reversed_y = 180 - y
-        return movavg(map_yaw_hist, reversed_y)
+        # APPLY ANGLE STABILITY CHECK BEFORE AVERAGING
+        stable_angle = enhanced_angle_stability_check(reversed_y)
+        return enhanced_moving_average(map_yaw_hist, stable_angle)
     
     return None
 
@@ -689,8 +905,32 @@ def save_screenshot():
     try:
         taking_screenshot = True
         
-        # CREATE A COPY OF THE CURRENT SCREEN CONTENT
-        screenshot_surface = screen.copy()
+        # CREATE A CLEAN SCREENSHOT WITHOUT OVERLAY MESSAGES
+        screenshot_surface = pygame.Surface((WIDTH, HEIGHT))
+        screenshot_surface.fill(BLACK)
+        
+        # TEMPORARILY SWITCH TO SCREENSHOT SURFACE
+        global screen
+        original_screen = screen
+        screen = screenshot_surface
+        
+        # RENDER CLEAN VERSION WITHOUT OVERLAY MESSAGES
+        if scan_active:
+            if view_mode == VIEW_MODE_2D:
+                draw_radar_display(show_overlay_messages=False)  # PASS PARAMETER TO HIDE MESSAGES
+                draw_scan_data()
+                if beam_angle is not None and not scan_paused:
+                    beam_display_distance = clamp(beam_distance, 0.0, MAX_CM) if sensor["object"].lower() != "none" and beam_distance < MAX_CM else MAX_CM
+                    draw_beam(beam_angle, beam_display_distance)
+            else:
+                draw_3d_wireframe_view()
+        else:
+            draw_idle_screen()
+        
+        draw_ui()
+        
+        # RESTORE ORIGINAL SCREEN
+        screen = original_screen
         
         downloads_dir = get_downloads_folder()
         
@@ -735,7 +975,7 @@ def draw_card(surface, x, y, w, h, title, content, title_color=WHITE, bg_color=(
         surface.blit(text_surf, (x + 15, content_y))
         content_y += line_height
 
-def draw_radar_display():
+def draw_radar_display(show_overlay_messages=True):
     CENTER_X, CENTER_Y = get_center()
     
     pygame.draw.arc(
@@ -793,7 +1033,8 @@ def draw_radar_display():
         label_rect = label.get_rect(center=label_pos)
         screen.blit(label, label_rect)
         
-    if scan_active and not screenshot_message and not taking_screenshot and not scan_paused:
+    # ONLY SHOW OVERLAY MESSAGES IF NOT TAKING SCREENSHOT
+    if show_overlay_messages and scan_active and not screenshot_message and not taking_screenshot and not scan_paused:
         instruction_text = font_medium.render("ROTATE THE SENSOR VERY SLOW", True, WHITE)
         text_rect = instruction_text.get_rect(center=(CENTER_X, CENTER_Y + 35))
         screen.blit(instruction_text, text_rect)
@@ -803,7 +1044,7 @@ def draw_radar_display():
         instruction_text3 = font_medium.render("If the app freezes, press X to restart", True, WHITE)
         text_rect3 = instruction_text3.get_rect(center=(CENTER_X, CENTER_Y + 95))
         screen.blit(instruction_text3, text_rect3)
-    elif scan_paused and not screenshot_message and not taking_screenshot:
+    elif show_overlay_messages and scan_paused and not screenshot_message and not taking_screenshot:
         paused_text = font_large.render("SCAN PAUSED - Press P to resume", True, ORANGE)
         text_rect = paused_text.get_rect(center=(CENTER_X, CENTER_Y + 50))
         screen.blit(paused_text, text_rect)
@@ -1103,37 +1344,16 @@ while running:
         elif e.type == pygame.MOUSEMOTION:
             handle_mouse_motion(e)
         elif e.type == pygame.KEYDOWN:
-            if e.key == pygame.K_r:
-                scan_points.clear()
-                scan_active = True
-                scan_paused = False
-                map_yaw_hist.clear()
-                beam_yaw_hist.clear()
-                distance_filter.clear()
-                camera_zoom = 1.0
-                camera_rotation_x = -90
-                camera_rotation_y = 0
-                camera_pan_x = 0
-                camera_pan_y = 0
-            elif e.key == pygame.K_c:
-                yaw_offset = sensor["yaw_instant"] - 90.0
-                calibrated = True
-                map_yaw_hist.clear()
-                beam_yaw_hist.clear()
-                distance_filter.clear()
-                for _ in range(BEAM_SMOOTH_N):
-                    beam_yaw_hist.append(90.0)
-                for _ in range(MAP_SMOOTH_N):
-                    map_yaw_hist.append(90.0)
-                try:
-                    ser.write(b"CALIB\n")
-                    ser.flush()
-                except Exception as e:
-                    print(f"Failed to send calibration command: {e}")
-            elif e.key == pygame.K_p:
+            # R KEY - RESET SCAN WITH DEBOUNCING AND ERROR HANDLING
+            if e.key == pygame.K_r and is_key_debounced('R'):
+                safe_reset_scan()
+            # C KEY - CALIBRATE SENSOR WITH DEBOUNCING AND ERROR HANDLING
+            elif e.key == pygame.K_c and is_key_debounced('C'):
+                safe_calibrate_sensor()
+            elif e.key == pygame.K_p and is_key_debounced('P'):
                 if scan_active:
                     scan_paused = not scan_paused
-            elif e.key == pygame.K_v:
+            elif e.key == pygame.K_v and is_key_debounced('V'):
                 if scan_active:
                     view_mode = VIEW_MODE_3D if view_mode == VIEW_MODE_2D else VIEW_MODE_2D
                     if view_mode == VIEW_MODE_3D:
@@ -1142,9 +1362,9 @@ while running:
                         camera_rotation_y = 0
                         camera_pan_x = 0
                         camera_pan_y = 0
-            elif e.key == pygame.K_s:
+            elif e.key == pygame.K_s and is_key_debounced('S'):
                 save_screenshot()
-            elif e.key == pygame.K_x:
+            elif e.key == pygame.K_x and is_key_debounced('X'):
                 reset_to_idle()
             elif e.key == pygame.K_F11:
                 fullscreen = not fullscreen
@@ -1154,30 +1374,34 @@ while running:
                     fullscreen = False
                     screen = setup_display_mode(DEFAULT_WIDTH, DEFAULT_HEIGHT, False)
 
-    if ser.in_waiting and scan_active and not scan_paused:
+    # ENHANCED SERIAL COMMUNICATION WITH IMPROVED ERROR HANDLING AND FILTERING
+    if ser and ser.is_open and scan_active and not scan_paused:
         try:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line:
-                parsed = parse_line(line)
-                
-                if "distance" in parsed:
-                    raw_dist = float(parsed["distance"])
-                    filtered_dist = filter_distance(raw_dist)
-                    sensor["distance_raw"] = raw_dist
-                    current_distance = filtered_dist
-                    beam_distance = filtered_dist
-                
-                if "yaw" in parsed:
-                    raw_yaw = wrap360(float(parsed["yaw"]))
-                    sensor["yaw_instant"] = raw_yaw
-                    sensor["yaw_raw"] = raw_yaw
-                
-                if "direction" in parsed: sensor["direction"] = parsed["direction"]
-                if "object" in parsed: sensor["object"] = parsed["object"]
-                if "gyro" in parsed: sensor["gyro"] = parsed["gyro"]
+            if ser.in_waiting:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    parsed = parse_line(line)
+                    
+                    if "distance" in parsed:
+                        raw_dist = float(parsed["distance"])
+                        # APPLY ENHANCED DISTANCE FILTERING
+                        filtered_dist = advanced_distance_filter(raw_dist)
+                        sensor["distance_raw"] = raw_dist
+                        current_distance = filtered_dist
+                        beam_distance = filtered_dist
+                    
+                    if "yaw" in parsed:
+                        raw_yaw = wrap360(float(parsed["yaw"]))
+                        sensor["yaw_instant"] = raw_yaw
+                        sensor["yaw_raw"] = raw_yaw
+                    
+                    if "direction" in parsed: sensor["direction"] = parsed["direction"]
+                    if "object" in parsed: sensor["object"] = parsed["object"]
+                    if "gyro" in parsed: sensor["gyro"] = parsed["gyro"]
         except Exception as e:
-            print(f"Serial read error: {e}")
+            print(f"SERIAL READ ERROR: {e}")
 
+    # ENHANCED SCAN DATA PROCESSING WITH CORNER DETECTION AND STABILITY
     if scan_active and not scan_paused:
         beam_angle = get_beam_angle(sensor["yaw_instant"])
         map_angle = get_map_angle(sensor["yaw_raw"])
@@ -1186,12 +1410,18 @@ while running:
             angle_key = int(round(map_angle))
             has_object = sensor["object"].lower() != "none" and current_distance <= MAX_CM
             
+            # APPLY CORNER DETECTION FOR ENHANCED ACCURACY
+            is_corner = detect_corner_and_optimize(map_angle, current_distance)
+            
             display_distance = current_distance if has_object else MAX_CM
             
+            # ENHANCED SCAN POINT STORAGE WITH CORNER DETECTION INFO
             scan_points[angle_key] = {
                 'coord': polar_to_xy(angle_key, min(display_distance, MAX_CM)),
                 'has_object': has_object,
-                'distance': current_distance
+                'distance': current_distance,
+                'is_corner': is_corner,
+                'stability_score': len(angle_stability_buffer) / ANGLE_STABILITY_N  # STABILITY INDICATOR
             }
     else:
         beam_angle = get_beam_angle(sensor["yaw_instant"]) if scan_active else None
@@ -1200,5 +1430,9 @@ while running:
     pygame.display.flip()
     clock.tick(60)
 
-ser.close()
+try:
+    if ser and ser.is_open:
+        ser.close()
+except:
+    pass
 pygame.quit()
