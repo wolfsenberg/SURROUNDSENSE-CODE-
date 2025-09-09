@@ -1,288 +1,1438 @@
+import os
+import sys
 import serial
+import serial.tools.list_ports
 import pygame
 import time
 import math
+from collections import deque
+from datetime import datetime
+import numpy as np
 
-# === SETTINGS ===
-PORT = 'COM4'
+def find_arduino_port():
+    """AUTO-DETECT ARDUINO COM PORT"""
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        if any(keyword in port.description.upper() for keyword in 
+               ['ARDUINO', 'CH340', 'CH341', 'FTDI', 'USB-SERIAL']):
+            return port.device
+    
+    for port_name in ['COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8']:
+        try:
+            test_port = serial.Serial(port_name, 9600, timeout=1)
+            test_port.close()
+            return port_name
+        except:
+            continue
+    return None
+
+def reset_to_idle():
+    """RESET APP TO IDLE MODE AND CLEAR ALL CACHED DATA + RESTART SERIAL CONNECTION"""
+    global scan_active, scan_paused, calibrated, yaw_offset, current_distance, beam_distance
+    global camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
+    global view_mode, screenshot_message, screenshot_timer, taking_screenshot, ser
+    
+    print("EXECUTING COMPLETE SYSTEM RESET...")
+    
+    try:
+        # RESET ALL STATE VARIABLES
+        scan_active = False
+        scan_paused = False
+        calibrated = False
+        yaw_offset = 0.0
+        current_distance = 0.0
+        beam_distance = 0.0
+        
+        # CLEAR ALL DATA STRUCTURES
+        scan_points.clear()
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
+        distance_filter.clear()
+        angle_stability_buffer.clear()
+        corner_detection_buffer.clear()
+        
+        # RESET SENSOR DATA TO DEFAULTS
+        sensor.update({
+            "distance_raw": 0.0,
+            "yaw_raw": 90.0,
+            "yaw_instant": 90.0,
+            "direction": "Stationary",
+            "object": "None",
+            "gyro": "Still",
+        })
+        
+        # RESET CAMERA SETTINGS
+        camera_zoom = 1.0
+        camera_rotation_x = -90
+        camera_rotation_y = 0
+        camera_pan_x = 0
+        camera_pan_y = 0
+        view_mode = VIEW_MODE_2D
+        
+        # RESET UI MESSAGES
+        screenshot_message = ""
+        screenshot_timer = 0
+        taking_screenshot = False
+        
+        # RESTART SERIAL CONNECTION TO FIX FROZEN COMMUNICATION
+        try:
+            if ser and ser.is_open:
+                print("CLOSING EXISTING SERIAL CONNECTION...")
+                ser.close()
+                time.sleep(0.5)  # WAIT FOR CLEAN CLOSURE
+        except Exception as e:
+            print(f"Error closing serial connection: {e}")
+        
+        # REESTABLISH SERIAL CONNECTION
+        try:
+            print("REESTABLISHING SERIAL CONNECTION...")
+            PORT = find_arduino_port()
+            if PORT:
+                ser = serial.Serial(PORT, BAUD, timeout=1)
+                time.sleep(2)  # ARDUINO RESET TIME
+                
+                # FLUSH ANY EXISTING DATA IN BUFFERS
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                
+                # SEND RESET COMMAND TO ARDUINO
+                ser.write(b"RESET\n")
+                ser.flush()
+                print(f"SERIAL CONNECTION RESET ON {PORT}")
+            else:
+                print("WARNING: COULD NOT FIND ARDUINO PORT DURING RESET")
+        except Exception as e:
+            print(f"FAILED TO RESTART SERIAL CONNECTION: {e}")
+        
+        print("SYSTEM RESET COMPLETE - READY FOR NEW SCAN")
+        
+    except Exception as e:
+        print(f"ERROR DURING RESET: {e}")
+
+# CORE SETTINGS
 BAUD = 9600
-WIDTH, HEIGHT = 800, 600
-CENTER_X, CENTER_Y = WIDTH // 2, HEIGHT // 2
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 1380, 716
+MIN_WIDTH, MIN_HEIGHT = 1380, 716
+WIDTH, HEIGHT = DEFAULT_WIDTH, DEFAULT_HEIGHT
 
-# === SERIAL SETUP ===
+def get_center():
+    return WIDTH // 2 - 177, int(HEIGHT // 1.4) + PADDING_TOP
+
+MAX_CM = 70
+SCALE = 5
+
+# ENHANCED FILTERING PARAMETERS FOR STABILITY
+MAP_SMOOTH_N = 7  # INCREASED FOR SMOOTHER MAP UPDATES
+BEAM_SMOOTH_N = 5  # INCREASED FOR BEAM STABILITY
+DISTANCE_FILTER_N = 5  # INCREASED DISTANCE FILTERING
+ANGLE_STABILITY_N = 8  # NEW: ANGLE STABILITY BUFFER
+CORNER_DETECTION_N = 12  # NEW: CORNER DETECTION BUFFER
+
+distance_filter = deque(maxlen=DISTANCE_FILTER_N)
+angle_stability_buffer = deque(maxlen=ANGLE_STABILITY_N)  # NEW: FOR ANGLE STABILITY
+corner_detection_buffer = deque(maxlen=CORNER_DETECTION_N)  # NEW: FOR CORNER DETECTION
+
+# ENHANCED FILTERING THRESHOLDS
+DISTANCE_CHANGE_THRESHOLD = 8.0  # MINIMUM DISTANCE CHANGE TO REGISTER
+ANGLE_STABILITY_THRESHOLD = 2.5  # ANGLE VARIATION THRESHOLD FOR STABILITY
+CORNER_DETECTION_THRESHOLD = 15.0  # DISTANCE CHANGE THRESHOLD FOR CORNER DETECTION
+
+# KEY DEBOUNCING VARIABLES
+last_key_times = {}
+KEY_DEBOUNCE_DELAY = 200  # MILLISECONDS BETWEEN KEY PRESSES
+
+# COLORS
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+GREEN = (0, 255, 0)
+LIGHT_GREEN = (100, 255, 100)
+DARK_GREEN = (0, 180, 0)
+RED = (255, 50, 50)
+GRAY = (60, 60, 60)
+LIGHT_GRAY = (120, 120, 120)
+DARK_GRAY = (30, 30, 30)
+BLUE = (100, 150, 255)
+ORANGE = (255, 165, 0)
+PURPLE = (200, 100, 255)
+CYAN = (0, 255, 255)
+
+PADDING_TOP = 30
+
+# VIEW MODES
+VIEW_MODE_2D = 0
+VIEW_MODE_3D = 1
+view_mode = VIEW_MODE_2D
+
+# 3D CAMERA SETTINGS
+camera_zoom = 1.0
+camera_rotation_x = -90
+camera_rotation_y = 0
+camera_pan_x = 0
+camera_pan_y = 0
+
+mouse_dragging = False
+last_mouse_pos = (0, 0)
+mouse_drag_mode = None
+
+scan_paused = False
+
+display_state = {
+    'surface_cache': None,
+    'last_width': 0,
+    'last_height': 0,
+    'frame_buffer': None
+}
+
+# SERIAL CONNECTION SETUP
+PORT = find_arduino_port()
+if PORT is None:
+    print("No Arduino found! Check connection and drivers.")
+    input("Press Enter to exit...")
+    exit()
+
+print(f"Arduino found on {PORT}")
 ser = serial.Serial(PORT, BAUD, timeout=1)
 time.sleep(2)
 
-# === PYGAME INIT ===
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# PYGAME SETUP
 pygame.init()
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("TF Mini S with MPU6050 - Pen-like Drawing")
-font = pygame.font.SysFont("Arial", 18)
-clock = pygame.time.Clock()
-draw_surface = pygame.Surface((WIDTH, HEIGHT))
-draw_surface.fill((0, 0, 0))
+os.environ['SDL_VIDEO_WINDOW_POS'] = 'centered'
 
-# === RESET BUTTON ===
-reset_button_rect = pygame.Rect(WIDTH - 110, 10, 100, 30)
-
-# === CALIBRATION BUTTON ===
-calibrate_button_rect = pygame.Rect(WIDTH - 110, 50, 100, 30)
-
-# === STATE ===
-distance_cm = 9999
-yaw_angle = 0
-yaw_offset = 0  # For calibration
-current_pos_x = CENTER_X  # Current pen position
-current_pos_y = CENTER_Y
-last_pos_x = CENTER_X     # Last pen position
-last_pos_y = CENTER_Y
-calibrated = False
-is_drawing = False
-drawing_speed = 2  # How fast the "pen" moves (pixels per frame when drawing)
-
-# Gyro movement detection
-previous_yaw = 0
-yaw_history = []  # Store recent yaw values
-movement_threshold = 0.5  # Minimum degrees per frame to consider "moving"
-history_length = 10  # Number of frames to check for movement
-is_gyro_moving = False
-
-# === FUNCTIONS ===
-def calibrate_yaw():
-    """Set current yaw as the reference (0 degrees)"""
-    global yaw_offset, calibrated
-    yaw_offset = yaw_angle
-    calibrated = True
-    print(f"Calibrated! Yaw offset set to: {yaw_offset}")
-
-def get_calibrated_angle():
-    """Get the calibrated yaw angle (relative to calibration point)"""
-    if not calibrated:
-        return yaw_angle
-    calibrated_angle = yaw_angle - yaw_offset
-    # Normalize to -180 to 180 range
-    while calibrated_angle > 180:
-        calibrated_angle -= 360
-    while calibrated_angle < -180:
-        calibrated_angle += 360
-    return calibrated_angle
-
-def detect_gyro_movement():
-    """Detect if the gyro is currently moving"""
-    global is_gyro_moving, yaw_history, previous_yaw
+def find_icon_files():
+    """FIND BOTH ICO AND PNG FILES"""
+    icon_files = {'ico': None, 'png': None}
     
-    if not calibrated:
+    search_paths = [
+        os.getcwd(),
+        os.path.dirname(os.path.abspath(__file__)),
+        resource_path(""),
+        os.path.join(os.getcwd(), "assets"),
+        os.path.join(os.path.dirname(__file__), "assets"),
+    ]
+    
+    ico_names = ["objectscanner4.ico", "icon.ico", "app.ico"]
+    png_names = ["objectscanner4.png", "icon.png", "app.png"]
+    
+    for path in search_paths:
+        if icon_files['ico']:
+            break
+        for filename in ico_names:
+            full_path = os.path.join(path, filename)
+            if os.path.exists(full_path):
+                icon_files['ico'] = full_path
+                break
+    
+    for path in search_paths:
+        if icon_files['png']:
+            break
+        for filename in png_names:
+            full_path = os.path.join(path, filename)
+            if os.path.exists(full_path):
+                icon_files['png'] = full_path
+                break
+    
+    return icon_files
+
+def setup_window_icon(icon_files):
+    """SETUP WINDOW TAB ICON"""
+    try:
+        if icon_files['ico']:
+            try:
+                icon_surface = pygame.image.load(icon_files['ico'])
+                pygame.display.set_icon(icon_surface)
+                return True
+            except Exception:
+                pass
+        
+        if icon_files['png']:
+            try:
+                icon_surface = pygame.image.load(icon_files['png'])
+                pygame.display.set_icon(icon_surface)
+                return True
+            except Exception:
+                pass
+        
         return False
-    
-    current_calibrated_yaw = get_calibrated_angle()
-    
-    # Add current yaw to history
-    yaw_history.append(current_calibrated_yaw)
-    
-    # Keep history to specified length
-    if len(yaw_history) > history_length:
-        yaw_history.pop(0)
-    
-    # Need at least 3 readings to detect movement
-    if len(yaw_history) < 3:
-        is_gyro_moving = False
+        
+    except Exception:
         return False
-    
-    # Calculate movement over recent frames
-    recent_range = max(yaw_history[-5:]) - min(yaw_history[-5:]) if len(yaw_history) >= 5 else 0
-    
-    # Also check immediate change
-    immediate_change = abs(current_calibrated_yaw - previous_yaw)
-    
-    # Consider moving if there's been recent range of movement or immediate change
-    is_gyro_moving = (recent_range > movement_threshold) or (immediate_change > movement_threshold)
-    
-    previous_yaw = current_calibrated_yaw
-    return is_gyro_moving
 
-# === MAIN LOOP ===
-running = True
-while running:
-    screen.fill((0, 0, 0))
-    screen.blit(draw_surface, (0, 0))
-
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            if reset_button_rect.collidepoint(event.pos):
-                draw_surface.fill((0, 0, 0))
-                # Reset pen position to center
-                current_pos_x = CENTER_X
-                current_pos_y = CENTER_Y
-                last_pos_x = CENTER_X
-                last_pos_y = CENTER_Y
-                print("Drawing reset!")
-            elif calibrate_button_rect.collidepoint(event.pos):
-                calibrate_yaw()
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_c:  # Press 'C' to calibrate
-                calibrate_yaw()
-            elif event.key == pygame.K_r:  # Press 'R' to reset
-                draw_surface.fill((0, 0, 0))
-                current_pos_x = CENTER_X
-                current_pos_y = CENTER_Y
-                last_pos_x = CENTER_X
-                last_pos_y = CENTER_Y
-
-    # === READ SERIAL DATA ===
-    if ser.in_waiting:
+def setup_taskbar_icon(icon_files):
+    """SETUP TASKBAR ICON FOR WINDOWS"""
+    try:
+        import ctypes
+        
+        app_id = 'surroundsense.radar.scanner.v1'
         try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                parts = line.split(',')
-                for part in parts:
-                    if part.startswith("distance="):
-                        distance_cm = int(part.split("=")[1])
-                    elif part.startswith("yaw="):
-                        yaw_angle = float(part.split("=")[1])
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+        
+        if not icon_files['png']:
+            return False
+        
+        png_path = os.path.abspath(icon_files['png'])
+        hwnd = pygame.display.get_wm_info()["window"]
+        
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+        
+        hicon_small = ctypes.windll.user32.LoadImageW(
+            None, png_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE
+        )
+        hicon_big = ctypes.windll.user32.LoadImageW(
+            None, png_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE
+        )
+        
+        success = False
+        if hicon_small:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            success = True
+        
+        if hicon_big:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+            success = True
+        
+        return success
+            
+    except ImportError:
+        return False
+    except Exception:
+        return False
+
+def setup_all_icons():
+    """SETUP BOTH WINDOW AND TASKBAR ICONS"""
+    icon_files = find_icon_files()
+    window_success = setup_window_icon(icon_files)
+    return window_success, icon_files
+
+window_icon_success, icon_files = setup_all_icons()
+
+# REMOVE MINIMIZE/MAXIMIZE BUTTONS FROM WINDOW
+try:
+    import ctypes
+    import ctypes.wintypes
+    
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.DOUBLEBUF | pygame.HWSURFACE | pygame.RESIZABLE)
+    pygame.display.set_caption("SurroundSense")
+    
+    # GET WINDOW HANDLE AND REMOVE MINIMIZE/MAXIMIZE BUTTONS
+    hwnd = pygame.display.get_wm_info()["window"]
+    
+    GWL_STYLE = -16
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+    style = style & ~WS_MINIMIZEBOX & ~WS_MAXIMIZEBOX
+    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+    
+    # REFRESH WINDOW TO APPLY CHANGES
+    SWP_FRAMECHANGED = 0x0020
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0004
+    ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 
+                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    
+except:
+    # FALLBACK IF WINDOWS API DOESN'T WORK
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.DOUBLEBUF | pygame.HWSURFACE | pygame.RESIZABLE)
+    pygame.display.set_caption("SurroundSense")
+
+def setup_display_mode(width, height, fullscreen=False):
+    """SETUP DISPLAY MODE WITH PROPER BUFFERING TO PREVENT FLICKER"""
+    global screen, WIDTH, HEIGHT, display_state
+    
+    flags = pygame.DOUBLEBUF | pygame.HWSURFACE
+    
+    if fullscreen:
+        flags |= pygame.FULLSCREEN
+        screen = pygame.display.set_mode((0, 0), flags)
+        WIDTH, HEIGHT = screen.get_size()
+    else:
+        flags |= pygame.RESIZABLE
+        screen = pygame.display.set_mode((width, height), flags)
+        WIDTH, HEIGHT = width, height
+        
+        # REMOVE MINIMIZE/MAXIMIZE BUTTONS AGAIN AFTER DISPLAY MODE CHANGE
+        try:
+            import ctypes
+            hwnd = pygame.display.get_wm_info()["window"]
+            GWL_STYLE = -16
+            WS_MINIMIZEBOX = 0x00020000
+            WS_MAXIMIZEBOX = 0x00010000
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            style = style & ~WS_MINIMIZEBOX & ~WS_MAXIMIZEBOX
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+            SWP_FRAMECHANGED = 0x0020
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 
+                                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
         except:
             pass
-
-    # === DETECT GYRO MOVEMENT ===
-    detect_gyro_movement()
-
-    # === DETERMINE IF DRAWING ===
-    # Only draw when BOTH conditions are met:
-    # 1. Object is detected within 10cm
-    # 2. Gyro is actively moving
-    if 0 < distance_cm <= 10 and is_gyro_moving:
-        is_drawing = True
-    else:
-        is_drawing = False
-
-    # === CALCULATE MOVEMENT DIRECTION ===
-    if calibrated and is_drawing:
-        # Get current physical direction
-        current_angle = get_calibrated_angle()
-        angle_rad = math.radians(current_angle)
-        
-        # Calculate movement direction
-        dx = math.cos(angle_rad) * drawing_speed
-        dy = math.sin(angle_rad) * drawing_speed
-        
-        # Update pen position
-        last_pos_x = current_pos_x
-        last_pos_y = current_pos_y
-        current_pos_x += dx
-        current_pos_y += dy
-        
-        # Keep pen within screen bounds
-        current_pos_x = max(10, min(WIDTH - 10, current_pos_x))
-        current_pos_y = max(10, min(HEIGHT - 10, current_pos_y))
-        
-        # Draw line from last position to current position
-        pygame.draw.line(draw_surface, (0, 255, 0), 
-                        (int(last_pos_x), int(last_pos_y)), 
-                        (int(current_pos_x), int(current_pos_y)), 3)
-        
-        # Draw current pen position
-        pygame.draw.circle(screen, (255, 255, 0), 
-                          (int(current_pos_x), int(current_pos_y)), 5)
     
-    # === DRAW DIRECTION INDICATOR ===
-    if calibrated:
-        # Current direction indicator (white line from center)
-        current_angle = get_calibrated_angle()
-        angle_rad = math.radians(current_angle)
-        dx_indicator = math.cos(angle_rad)
-        dy_indicator = math.sin(angle_rad)
-        
-        indicator_length = 60
-        indicator_x = int(CENTER_X + dx_indicator * indicator_length)
-        indicator_y = int(CENTER_Y + dy_indicator * indicator_length)
-        
-        # Draw direction line
-        color = (255, 255, 255) if is_drawing else (100, 100, 100)
-        pygame.draw.line(screen, color, (CENTER_X, CENTER_Y), 
-                        (indicator_x, indicator_y), 2)
-        
-        # Draw center point
-        pygame.draw.circle(screen, (255, 255, 255), (CENTER_X, CENTER_Y), 3)
-        
-        # Reference direction (calibration line in blue)
-        ref_x = int(CENTER_X + 50)
-        ref_y = int(CENTER_Y)
-        pygame.draw.line(screen, (0, 0, 255), (CENTER_X, CENTER_Y), 
-                        (ref_x, ref_y), 1)
-
-    # === DRAW CURRENT PEN POSITION ===
-    if is_drawing:
-        # Green circle for active drawing (both conditions met)
-        pygame.draw.circle(screen, (0, 255, 0), 
-                          (int(current_pos_x), int(current_pos_y)), 6)
-    elif 0 < distance_cm <= 10 and not is_gyro_moving:
-        # Yellow circle for object detected but gyro not moving
-        pygame.draw.circle(screen, (255, 255, 0), 
-                          (int(current_pos_x), int(current_pos_y)), 5)
-    else:
-        # Red circle for not drawing (too far from object or other issues)
-        pygame.draw.circle(screen, (255, 0, 0), 
-                          (int(current_pos_x), int(current_pos_y)), 4)
-
-    # === UI ELEMENTS ===
-    # Reset button
-    pygame.draw.rect(screen, (200, 0, 0), reset_button_rect)
-    reset_text = font.render("RESET", True, (255, 255, 255))
-    screen.blit(reset_text, (WIDTH - 85, 15))
+    display_state['surface_cache'] = None
+    display_state['last_width'] = WIDTH
+    display_state['last_height'] = HEIGHT
+    display_state['frame_buffer'] = pygame.Surface((WIDTH, HEIGHT))
     
-    # Calibrate button
-    color = (0, 200, 0) if calibrated else (100, 100, 100)
-    pygame.draw.rect(screen, color, calibrate_button_rect)
-    cal_text = font.render("CALIB", True, (255, 255, 255))
-    screen.blit(cal_text, (WIDTH - 85, 55))
+    return screen
 
-    # === STATUS TEXT ===
-    distance_text = font.render(f"Distance: {distance_cm} cm", True, (255, 255, 255))
-    screen.blit(distance_text, (10, 10))
-    
-    yaw_text = font.render(f"Raw Yaw: {yaw_angle:.1f}°", True, (255, 255, 255))
-    screen.blit(yaw_text, (10, 35))
-    
-    if calibrated:
-        current_angle = get_calibrated_angle()
-        cal_yaw_text = font.render(f"Direction: {current_angle:.1f}°", True, (0, 255, 0))
-        screen.blit(cal_yaw_text, (10, 60))
+def setup_taskbar_post_display():
+    if icon_files and icon_files['png']:
+        taskbar_success = setup_taskbar_icon(icon_files)
+        return taskbar_success
+    return False
+
+taskbar_success = setup_taskbar_post_display()
+
+clock = pygame.time.Clock()
+font_small = pygame.font.SysFont('Arial', 14)
+font_medium = pygame.font.SysFont('Arial', 16, bold=True)
+font_large = pygame.font.SysFont('Arial', 20, bold=True)
+
+fullscreen = False
+
+screenshot_message = ""
+screenshot_timer = 0
+taking_screenshot = False
+
+map_yaw_hist = deque(maxlen=MAP_SMOOTH_N)
+beam_yaw_hist = deque(maxlen=BEAM_SMOOTH_N)
+
+sensor = {
+    "distance_raw": 0.0,
+    "yaw_raw": 90.0,
+    "yaw_instant": 90.0,
+    "direction": "Stationary",
+    "object": "None",
+    "gyro": "Still",
+}
+
+current_distance = 0.0
+beam_distance = 0.0
+calibrated = False
+yaw_offset = 0.0
+scan_active = False
+scan_points = {}
+
+def is_key_debounced(key):
+    """CHECK IF ENOUGH TIME HAS PASSED SINCE LAST KEY PRESS"""
+    current_time = pygame.time.get_ticks()
+    if key in last_key_times:
+        if current_time - last_key_times[key] < KEY_DEBOUNCE_DELAY:
+            return False
+    last_key_times[key] = current_time
+    return True
+
+def safe_reset_scan():
+    """SAFELY RESET SCAN WITH ERROR HANDLING"""
+    try:
+        global scan_active, scan_paused, camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
         
-        # More detailed drawing status
-        if is_drawing:
-            drawing_status = "DRAWING"
-            status_color = (0, 255, 0)
-        elif 0 < distance_cm <= 10 and not is_gyro_moving:
-            drawing_status = "OBJECT DETECTED - NOT MOVING"
-            status_color = (255, 255, 0)
-        elif distance_cm > 10 and is_gyro_moving:
-            drawing_status = "MOVING - NO OBJECT"
-            status_color = (255, 100, 100)
-        else:
-            drawing_status = "NOT DRAWING"
-            status_color = (255, 0, 0)
+        scan_points.clear()
+        scan_active = True
+        scan_paused = False
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
+        distance_filter.clear()
+        angle_stability_buffer.clear()
+        corner_detection_buffer.clear()
+        camera_zoom = 1.0
+        camera_rotation_x = -90
+        camera_rotation_y = 0
+        camera_pan_x = 0
+        camera_pan_y = 0
+        
+        print("SCAN RESET SUCCESSFUL")
+        
+    except Exception as e:
+        print(f"ERROR DURING SCAN RESET: {e}")
+
+def safe_calibrate_sensor():
+    """SAFELY CALIBRATE SENSOR WITH ERROR HANDLING"""
+    try:
+        global yaw_offset, calibrated
+        
+        yaw_offset = sensor["yaw_instant"] - 90.0
+        calibrated = True
+        map_yaw_hist.clear()
+        beam_yaw_hist.clear()
+        distance_filter.clear()
+        angle_stability_buffer.clear()
+        corner_detection_buffer.clear()
+        
+        for _ in range(BEAM_SMOOTH_N):
+            beam_yaw_hist.append(90.0)
+        for _ in range(MAP_SMOOTH_N):
+            map_yaw_hist.append(90.0)
+        for _ in range(ANGLE_STABILITY_N):
+            angle_stability_buffer.append(90.0)
+        
+        try:
+            if ser and ser.is_open:
+                ser.write(b"CALIB\n")
+                ser.flush()
+                print("CALIBRATION COMMAND SENT TO ARDUINO")
+        except Exception as serial_error:
+            print(f"SERIAL COMMUNICATION ERROR DURING CALIBRATION: {serial_error}")
+        
+        print("SENSOR CALIBRATION SUCCESSFUL")
+        
+    except Exception as e:
+        print(f"ERROR DURING SENSOR CALIBRATION: {e}")
+
+def advanced_distance_filter(raw_distance):
+    """ENHANCED DISTANCE FILTERING WITH OUTLIER REJECTION AND STABILITY CHECKS"""
+    try:
+        # CLAMP TO MAX RANGE
+        clamped_distance = min(raw_distance, MAX_CM)
+        
+        # ADD TO FILTER BUFFER
+        distance_filter.append(clamped_distance)
+        
+        if len(distance_filter) < 3:
+            return clamped_distance
+        
+        # CONVERT TO LIST FOR STATISTICAL ANALYSIS
+        distances = list(distance_filter)
+        
+        # CALCULATE STATISTICAL MEASURES
+        mean_dist = sum(distances) / len(distances)
+        sorted_distances = sorted(distances)
+        median_dist = sorted_distances[len(sorted_distances) // 2]
+        
+        # OUTLIER DETECTION USING INTERQUARTILE RANGE
+        if len(distances) >= 4:
+            q1_idx = len(sorted_distances) // 4
+            q3_idx = 3 * len(sorted_distances) // 4
+            q1 = sorted_distances[q1_idx]
+            q3 = sorted_distances[q3_idx]
+            iqr = q3 - q1
             
-        status_text = font.render(f"Status: {drawing_status}", True, status_color)
-        screen.blit(status_text, (10, 85))
+            # REMOVE OUTLIERS THAT ARE TOO FAR FROM THE MEDIAN
+            outlier_threshold = 1.5 * iqr
+            filtered_distances = [d for d in distances if abs(d - median_dist) <= outlier_threshold + 5.0]
+            
+            if filtered_distances:
+                # USE WEIGHTED AVERAGE FAVORING RECENT READINGS
+                weights = [i + 1 for i in range(len(filtered_distances))]
+                weighted_avg = sum(d * w for d, w in zip(filtered_distances, weights)) / sum(weights)
+                return weighted_avg
         
-        # Movement indicator
-        movement_status = "MOVING" if is_gyro_moving else "STATIONARY"
-        movement_color = (0, 255, 0) if is_gyro_moving else (150, 150, 150)
-        movement_text = font.render(f"Gyro: {movement_status}", True, movement_color)
-        screen.blit(movement_text, (10, 110))
-    else:
-        status_text = font.render("Status: Press 'C' or CALIB to calibrate", True, (255, 255, 0))
-        screen.blit(status_text, (10, 60))
-    
-    pen_pos_text = font.render(f"Pen: ({int(current_pos_x)}, {int(current_pos_y)})", True, (255, 255, 255))
-    screen.blit(pen_pos_text, (10, 135))
-    
-    # Instructions
-    inst_text = font.render("Green=Drawing, Yellow=Object but not moving, Red=Not drawing", True, (200, 200, 200))
-    screen.blit(inst_text, (10, HEIGHT - 30))
+        # FALLBACK TO MEDIAN FOR STABILITY
+        return median_dist
+        
+    except Exception as e:
+        print(f"ERROR IN ENHANCED DISTANCE FILTERING: {e}")
+        return raw_distance
 
+def enhanced_angle_stability_check(raw_angle):
+    """CHECK ANGLE STABILITY TO REDUCE FLUCTUATIONS"""
+    try:
+        angle_stability_buffer.append(raw_angle)
+        
+        if len(angle_stability_buffer) < 3:
+            return raw_angle
+        
+        angles = list(angle_stability_buffer)
+        
+        # CALCULATE ANGLE VARIATION (HANDLING CIRCULAR NATURE OF ANGLES)
+        angle_diffs = []
+        for i in range(1, len(angles)):
+            diff = abs(angles[i] - angles[i-1])
+            # HANDLE CIRCULAR WRAP-AROUND
+            if diff > 180:
+                diff = 360 - diff
+            angle_diffs.append(diff)
+        
+        avg_variation = sum(angle_diffs) / len(angle_diffs)
+        
+        # IF VARIATION IS TOO HIGH, USE SMOOTHED VALUE
+        if avg_variation > ANGLE_STABILITY_THRESHOLD:
+            # APPLY WEIGHTED SMOOTHING
+            weights = [i + 1 for i in range(len(angles))]
+            weighted_sum = 0
+            weight_total = 0
+            
+            for angle, weight in zip(angles, weights):
+                weighted_sum += angle * weight
+                weight_total += weight
+            
+            return weighted_sum / weight_total
+        
+        return raw_angle
+        
+    except Exception as e:
+        print(f"ERROR IN ANGLE STABILITY CHECK: {e}")
+        return raw_angle
+
+def detect_corner_and_optimize(angle, distance):
+    """ENHANCED CORNER DETECTION FOR ACCURATE SCANNING"""
+    try:
+        corner_detection_buffer.append((angle, distance))
+        
+        if len(corner_detection_buffer) < 6:
+            return False
+        
+        # ANALYZE RECENT DISTANCE CHANGES TO DETECT CORNERS
+        recent_data = list(corner_detection_buffer)[-6:]
+        distances = [data[1] for data in recent_data]
+        
+        # CALCULATE DISTANCE DERIVATIVES TO FIND SHARP CHANGES
+        distance_changes = []
+        for i in range(1, len(distances)):
+            change = abs(distances[i] - distances[i-1])
+            distance_changes.append(change)
+        
+        # CHECK FOR SIGNIFICANT DISTANCE CHANGES INDICATING CORNERS
+        max_change = max(distance_changes) if distance_changes else 0
+        avg_change = sum(distance_changes) / len(distance_changes) if distance_changes else 0
+        
+        # CORNER DETECTED IF THERE'S A SIGNIFICANT SUDDEN CHANGE
+        is_corner = max_change > CORNER_DETECTION_THRESHOLD and max_change > avg_change * 2.5
+        
+        return is_corner
+        
+    except Exception as e:
+        print(f"ERROR IN CORNER DETECTION: {e}")
+        return False
+
+def rotate_point_3d(x, y, z, angle_x, angle_y, angle_z=0):
+    """ROTATE A 3D POINT AROUND ALL THREE AXES"""
+    ax, ay, az = math.radians(angle_x), math.radians(angle_y), math.radians(angle_z)
+    
+    y1 = y * math.cos(ax) - z * math.sin(ax)
+    z1 = y * math.sin(ax) + z * math.cos(ax)
+    y, z = y1, z1
+    
+    x1 = x * math.cos(ay) + z * math.sin(ay)
+    z1 = -x * math.sin(ay) + z * math.cos(ay)
+    x, z = x1, z1
+    
+    x1 = x * math.cos(az) - y * math.sin(az)
+    y1 = x * math.sin(az) + y * math.cos(az)
+    x, y = x1, y1
+    
+    return x, y, z
+
+def project_3d_to_2d(x, y, z, zoom=1.0, pan_x=0, pan_y=0):
+    """PROJECT 3D POINT TO 2D SCREEN COORDINATES"""
+    CENTER_X, CENTER_Y = get_center()
+    
+    screen_x = CENTER_X + (x * zoom) + pan_x
+    screen_y = CENTER_Y - (y * zoom) + pan_y
+    
+    return int(screen_x), int(screen_y)
+
+def generate_extruded_mesh():
+    """GENERATE 3D WIREFRAME MESH FROM SCAN POINTS"""
+    if not scan_points:
+        return [], []
+    
+    vertices = []
+    lines = []
+    
+    extrusion_height = 60
+    scale_factor = 2.0
+    
+    angles = sorted(scan_points.keys())
+    
+    if len(angles) < 2:
+        return vertices, lines
+    
+    base_points = []
+    top_points = []
+    
+    for angle in angles:
+        data = scan_points[angle]
+        if data['has_object']:
+            distance = data['distance'] * scale_factor
+            angle_rad = math.radians(angle)
+            
+            x = distance * math.cos(angle_rad)
+            z = distance * math.sin(angle_rad)
+            
+            base_point = (x, 0, z)
+            base_points.append(base_point)
+            vertices.append(base_point)
+            
+            top_point = (x, extrusion_height, z)
+            top_points.append(top_point)
+            vertices.append(top_point)
+    
+    num_points = len(base_points)
+    
+    if num_points >= 2:
+        for i in range(num_points - 1):
+            base_idx = i * 2
+            next_base_idx = (i + 1) * 2
+            lines.append((base_idx, next_base_idx))
+        
+        for i in range(num_points - 1):
+            top_idx = i * 2 + 1
+            next_top_idx = (i + 1) * 2 + 1
+            lines.append((top_idx, next_top_idx))
+        
+        for i in range(num_points):
+            base_idx = i * 2
+            top_idx = i * 2 + 1
+            lines.append((base_idx, top_idx))
+    
+    return vertices, lines
+
+def draw_3d_wireframe_view():
+    """DRAW 3D WIREFRAME VIEW"""
+    global camera_zoom, camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y
+    
+    vertices, lines = generate_extruded_mesh()
+    
+    if not vertices or not lines:
+        CENTER_X, CENTER_Y = get_center()
+        empty_text = font_large.render("3D VIEW - NO SCAN DATA", True, GRAY)
+        text_rect = empty_text.get_rect(center=(CENTER_X, CENTER_Y))
+        screen.blit(empty_text, text_rect)
+        return
+    
+    projected_vertices = []
+    
+    for x, y, z in vertices:
+        rx, ry, rz = rotate_point_3d(x, y, z, camera_rotation_x, camera_rotation_y)
+        screen_x, screen_y = project_3d_to_2d(rx, ry, rz, camera_zoom, camera_pan_x, camera_pan_y)
+        projected_vertices.append((screen_x, screen_y))
+    
+    for line in lines:
+        start_idx, end_idx = line
+        
+        if start_idx < len(projected_vertices) and end_idx < len(projected_vertices):
+            start_pos = projected_vertices[start_idx]
+            end_pos = projected_vertices[end_idx]
+            
+            if (-1000 <= start_pos[0] <= WIDTH + 1000 and -1000 <= start_pos[1] <= HEIGHT + 1000 and
+                -1000 <= end_pos[0] <= WIDTH + 1000 and -1000 <= end_pos[1] <= HEIGHT + 1000):
+                pygame.draw.line(screen, LIGHT_GREEN, start_pos, end_pos, 2)
+    
+    origin_3d = rotate_point_3d(0, 0, 0, camera_rotation_x, camera_rotation_y)
+    origin_2d = project_3d_to_2d(origin_3d[0], origin_3d[1], origin_3d[2], camera_zoom, camera_pan_x, camera_pan_y)
+    
+    if 0 <= origin_2d[0] < WIDTH and 0 <= origin_2d[1] < HEIGHT:
+        pygame.draw.circle(screen, RED, origin_2d, 8)
+        pygame.draw.circle(screen, WHITE, origin_2d, 6)
+    
+    if not taking_screenshot:
+        help_text = [
+            "3D NAVIGATION:",
+            "Hold Left Click: Rotate View",
+            "Hold Right Click: Pan view", 
+            "Scroll Wheel: Zoom in/out"
+        ]
+        
+        y_offset = HEIGHT - 120
+        for i, text in enumerate(help_text):
+            color = CYAN if i == 0 else WHITE
+            help_surface = font_medium.render(text, True, color)
+            screen.blit(help_surface, (20, y_offset + i * 18))
+
+def handle_mouse_wheel(event):
+    """HANDLE ZOOM WITH MOUSE WHEEL"""
+    global camera_zoom
+    
+    if view_mode == VIEW_MODE_3D:
+        zoom_factor = 1.1 if event.y > 0 else 0.9
+        camera_zoom = max(0.1, min(5.0, camera_zoom * zoom_factor))
+
+def handle_mouse_button_down(event):
+    """START MOUSE DRAG OPERATIONS"""
+    global mouse_dragging, last_mouse_pos, mouse_drag_mode
+    
+    if view_mode == VIEW_MODE_3D:
+        if event.button == 1:
+            mouse_dragging = True
+            mouse_drag_mode = 'rotate'
+            last_mouse_pos = pygame.mouse.get_pos()
+        elif event.button == 3:
+            mouse_dragging = True
+            mouse_drag_mode = 'pan'
+            last_mouse_pos = pygame.mouse.get_pos()
+
+def handle_mouse_button_up(event):
+    """END MOUSE DRAG OPERATIONS"""
+    global mouse_dragging, mouse_drag_mode
+    
+    if event.button in [1, 3]:
+        mouse_dragging = False
+        mouse_drag_mode = None
+
+def handle_mouse_motion(event):
+    """HANDLE MOUSE DRAG FOR 3D NAVIGATION"""
+    global camera_rotation_x, camera_rotation_y, camera_pan_x, camera_pan_y, last_mouse_pos
+    
+    if view_mode == VIEW_MODE_3D and mouse_dragging:
+        mouse_x, mouse_y = pygame.mouse.get_pos()
+        dx = mouse_x - last_mouse_pos[0]
+        dy = mouse_y - last_mouse_pos[1]
+        
+        if mouse_drag_mode == 'rotate':
+            camera_rotation_y += dx * 0.5
+            camera_rotation_x += dy * 0.5
+            camera_rotation_x = max(-90, min(90, camera_rotation_x))
+            
+        elif mouse_drag_mode == 'pan':
+            camera_pan_x += dx * 2
+            camera_pan_y += dy * 2
+        
+        last_mouse_pos = (mouse_x, mouse_y)
+
+def clamp(v, lo, hi): 
+    return max(lo, min(hi, v))
+
+def movavg(buf, val): 
+    buf.append(val)
+    return sum(buf)/len(buf)
+
+def enhanced_moving_average(buf, val):
+    """ENHANCED MOVING AVERAGE WITH STABILITY WEIGHTING"""
+    buf.append(val)
+    if len(buf) <= 1:
+        return val
+    
+    # APPLY WEIGHTED AVERAGE FAVORING RECENT VALUES BUT MAINTAINING STABILITY
+    values = list(buf)
+    weights = [i + 1 for i in range(len(values))]
+    
+    # CALCULATE WEIGHTED AVERAGE
+    weighted_sum = sum(v * w for v, w in zip(values, weights))
+    weight_total = sum(weights)
+    
+    return weighted_sum / weight_total
+
+def wrap360(a):
+    while a < 0: a += 360
+    while a >= 360: a -= 360
+    return a
+
+def parse_line(line):
+    out = {}
+    for part in line.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+def get_beam_angle(yaw_raw):
+    """CALCULATE BEAM ANGLE WITH ENHANCED CALIBRATION AND STABILITY"""
+    if not calibrated:
+        return enhanced_moving_average(beam_yaw_hist, 90.0)
+    else:
+        y = yaw_raw - yaw_offset
+    
+    y = wrap360(y)
+    
+    if 0.0 <= y <= 180.0:
+        reversed_y = 180 - y
+        # APPLY ANGLE STABILITY CHECK BEFORE AVERAGING
+        stable_angle = enhanced_angle_stability_check(reversed_y)
+        return enhanced_moving_average(beam_yaw_hist, stable_angle)
+    
+    return None
+
+def get_map_angle(yaw_raw):
+    """CALCULATE MAP ANGLE WITH ENHANCED CALIBRATION AND STABILITY"""
+    if not calibrated:
+        return enhanced_moving_average(map_yaw_hist, 90.0)
+    else:
+        y = yaw_raw - yaw_offset
+    
+    y = wrap360(y)
+    
+    if 0.0 <= y <= 180.0:
+        reversed_y = 180 - y
+        # APPLY ANGLE STABILITY CHECK BEFORE AVERAGING
+        stable_angle = enhanced_angle_stability_check(reversed_y)
+        return enhanced_moving_average(map_yaw_hist, stable_angle)
+    
+    return None
+
+def polar_to_xy(angle_deg, dist_cm):
+    CENTER_X, CENTER_Y = get_center()
+    r = dist_cm * SCALE
+    a = math.radians(angle_deg)
+    x = CENTER_X + r * math.cos(a)
+    y = CENTER_Y - r * math.sin(a)
+    return (int(x), int(y))
+
+def get_downloads_folder():
+    """GET USER'S DOWNLOADS FOLDER PATH"""
+    try:
+        if os.name == 'nt':
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
+                              r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
+                downloads_path = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")[0]
+                if os.path.exists(downloads_path):
+                    return downloads_path
+            
+            downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+            if os.path.exists(downloads_path):
+                return downloads_path
+        
+        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        if os.path.exists(downloads_path):
+            return downloads_path
+            
+        return os.getcwd()
+        
+    except Exception:
+        return os.getcwd()
+
+def save_screenshot():
+    """SAVE CURRENT SCREEN AS PNG TO DOWNLOADS FOLDER"""
+    global screenshot_message, screenshot_timer, taking_screenshot
+    
+    try:
+        taking_screenshot = True
+        
+        # CREATE A CLEAN SCREENSHOT WITHOUT OVERLAY MESSAGES
+        screenshot_surface = pygame.Surface((WIDTH, HEIGHT))
+        screenshot_surface.fill(BLACK)
+        
+        # TEMPORARILY SWITCH TO SCREENSHOT SURFACE
+        global screen
+        original_screen = screen
+        screen = screenshot_surface
+        
+        # RENDER CLEAN VERSION WITHOUT OVERLAY MESSAGES
+        if scan_active:
+            if view_mode == VIEW_MODE_2D:
+                draw_radar_display(show_overlay_messages=False)  # PASS PARAMETER TO HIDE MESSAGES
+                draw_scan_data()
+                if beam_angle is not None and not scan_paused:
+                    beam_display_distance = clamp(beam_distance, 0.0, MAX_CM) if sensor["object"].lower() != "none" and beam_distance < MAX_CM else MAX_CM
+                    draw_beam(beam_angle, beam_display_distance)
+            else:
+                draw_3d_wireframe_view()
+        else:
+            draw_idle_screen()
+        
+        draw_ui()
+        
+        # RESTORE ORIGINAL SCREEN
+        screen = original_screen
+        
+        downloads_dir = get_downloads_folder()
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        view_suffix = "3D" if view_mode == VIEW_MODE_3D else "2D"
+        filename = f"SurroundSense_Radar_{view_suffix}_{timestamp}.png"
+        filepath = os.path.join(downloads_dir, filename)
+        
+        pygame.image.save(screenshot_surface, filepath)
+        
+        taking_screenshot = False
+        
+        screenshot_message = f"SUCCESS|Saved to Downloads: {filename}"
+        screenshot_timer = pygame.time.get_ticks() + 4000
+        
+        return True
+        
+    except Exception as e:
+        taking_screenshot = False
+        screenshot_message = f"ERROR|Save failed: {str(e)[:50]}..."
+        screenshot_timer = pygame.time.get_ticks() + 4000
+        return False
+
+def draw_card(surface, x, y, w, h, title, content, title_color=WHITE, bg_color=(25, 25, 25)):
+    w = max(w, 200)
+    h = max(h, 80)
+    
+    card_rect = pygame.Rect(x, y, w, h)
+    pygame.draw.rect(surface, bg_color, card_rect, border_radius=12)
+    pygame.draw.rect(surface, (70, 70, 70), card_rect, 2, border_radius=12)
+    
+    title_surf = font_medium.render(title, True, title_color)
+    surface.blit(title_surf, (x + 15, y + 12))
+    
+    content_y = y + 35
+    line_height = 16 if h < 100 else 18
+    
+    for line in content:
+        if content_y + line_height > y + h - 10:
+            break
+        text_surf = font_small.render(line, True, WHITE)
+        surface.blit(text_surf, (x + 15, content_y))
+        content_y += line_height
+
+def draw_radar_display(show_overlay_messages=True):
+    CENTER_X, CENTER_Y = get_center()
+    
+    pygame.draw.arc(
+        screen,
+        (15, 15, 15),
+        pygame.Rect(
+            CENTER_X - (MAX_CM * SCALE + 10),
+            CENTER_Y - (MAX_CM * SCALE + 10),
+            2 * (MAX_CM * SCALE + 10),
+            2 * (MAX_CM * SCALE + 10)
+        ),
+        math.radians(0),
+        math.radians(180),
+        10
+    )
+
+    pygame.draw.arc(
+        screen,
+        GRAY,
+        pygame.Rect(
+            CENTER_X - MAX_CM * SCALE,
+            CENTER_Y - MAX_CM * SCALE,
+            2 * MAX_CM * SCALE,
+            2 * MAX_CM * SCALE
+        ),
+        math.radians(0),
+        math.radians(180),
+        2
+    )
+
+    for r in [10, 20, 30, 40, 50, 60, 70]:
+        pygame.draw.arc(
+            screen,
+            DARK_GRAY,
+            pygame.Rect(CENTER_X - r * SCALE, CENTER_Y - r * SCALE, r * SCALE * 2, r * SCALE * 2),
+            math.radians(0),
+            math.radians(180),
+            1
+        )
+
+    for angle in range(0, 181, 30):
+        end_pos = polar_to_xy(angle, MAX_CM)
+        color = LIGHT_GRAY if angle == 90 else DARK_GRAY
+        width = 2 if angle == 90 else 1
+        pygame.draw.line(screen, color, (CENTER_X, CENTER_Y), end_pos, width)
+
+    for r in [10, 20, 30, 40, 50, 60, 70]:
+        label_pos = polar_to_xy(90, r)
+        label = font_small.render(f"{r}cm", True, LIGHT_GRAY)
+        screen.blit(label, (label_pos[0] - 12, label_pos[1] - 8))
+
+    for angle in [0, 30, 60, 90, 120, 150, 180]:
+        label_pos = polar_to_xy(angle, MAX_CM + 15)
+        label = font_small.render(f"{angle}°", True, LIGHT_GRAY)
+        label_rect = label.get_rect(center=label_pos)
+        screen.blit(label, label_rect)
+        
+    # ONLY SHOW OVERLAY MESSAGES IF NOT TAKING SCREENSHOT
+    if show_overlay_messages and scan_active and not screenshot_message and not taking_screenshot and not scan_paused:
+        instruction_text = font_medium.render("ROTATE THE SENSOR VERY SLOW", True, WHITE)
+        text_rect = instruction_text.get_rect(center=(CENTER_X, CENTER_Y + 35))
+        screen.blit(instruction_text, text_rect)
+        instruction_text2 = font_medium.render("Ensure the area is well-lit and the sensor is calibrated (press C to calibrate)", True, WHITE)
+        text_rect2 = instruction_text2.get_rect(center=(CENTER_X, CENTER_Y + 65))
+        screen.blit(instruction_text2, text_rect2)
+        instruction_text3 = font_medium.render("If the app freezes, press X to restart", True, WHITE)
+        text_rect3 = instruction_text3.get_rect(center=(CENTER_X, CENTER_Y + 95))
+        screen.blit(instruction_text3, text_rect3)
+    elif show_overlay_messages and scan_paused and not screenshot_message and not taking_screenshot:
+        paused_text = font_large.render("SCAN PAUSED - Press P to resume", True, ORANGE)
+        text_rect = paused_text.get_rect(center=(CENTER_X, CENTER_Y + 50))
+        screen.blit(paused_text, text_rect)
+
+def draw_scan_data():
+    if not scan_points:
+        return
+    
+    all_angles = sorted(scan_points.keys())
+    if len(all_angles) > 1:
+        for i in range(len(all_angles) - 1):
+            angle1 = all_angles[i]
+            angle2 = all_angles[i + 1]
+            
+            data1 = scan_points[angle1]
+            data2 = scan_points[angle2]
+            
+            coord1 = data1['coord'] if data1['has_object'] else polar_to_xy(angle1, MAX_CM)
+            coord2 = data2['coord'] if data2['has_object'] else polar_to_xy(angle2, MAX_CM)
+            
+            draw_dotted_line(coord1, coord2, GREEN, dot_size=1, spacing=2)
+
+def draw_dotted_line(start_pos, end_pos, color, dot_size=1, spacing=2):
+    """DRAW DOTTED LINE BETWEEN TWO POINTS"""
+    start_x, start_y = start_pos
+    end_x, end_y = end_pos
+    
+    dx = end_x - start_x
+    dy = end_y - start_y
+    distance = math.sqrt(dx*dx + dy*dy)
+    
+    if distance == 0:
+        return
+    
+    num_dots = int(distance / spacing) + 1
+    for i in range(num_dots + 1):
+        progress = i / max(num_dots, 1) if num_dots > 0 else 0
+        dot_x = start_x + progress * dx
+        dot_y = start_y + progress * dy
+        pygame.draw.circle(screen, color, (int(dot_x), int(dot_y)), dot_size)
+
+def draw_beam(angle_deg, dist_cm):
+    if angle_deg is None:
+        return
+    
+    CENTER_X, CENTER_Y = get_center()
+    end_point = polar_to_xy(angle_deg, dist_cm)
+    
+    pygame.draw.line(screen, LIGHT_GREEN, (CENTER_X, CENTER_Y), end_point, 4)
+    pygame.draw.line(screen, GREEN, (CENTER_X, CENTER_Y), end_point, 2)
+    
+    if sensor["object"].lower() != "none" and dist_cm < MAX_CM:
+        pygame.draw.circle(screen, RED, end_point, 12)
+        pygame.draw.circle(screen, WHITE, end_point, 12, 3)
+        pygame.draw.circle(screen, RED, end_point, 6)
+    
+    pygame.draw.circle(screen, WHITE, (CENTER_X, CENTER_Y), 8)
+    pygame.draw.circle(screen, BLUE, (CENTER_X, CENTER_Y), 6)
+
+def draw_idle_screen():
+    """DRAW IDLE SCREEN WHEN SCAN IS NOT ACTIVE"""
+    CENTER_X, CENTER_Y = get_center()
+    
+    pygame.draw.arc(
+        screen,
+        (40, 40, 40),
+        pygame.Rect(
+            CENTER_X - MAX_CM * SCALE,
+            CENTER_Y - MAX_CM * SCALE,
+            2 * MAX_CM * SCALE,
+            2 * MAX_CM * SCALE
+        ),
+        math.radians(0),
+        math.radians(180),
+        2
+    )
+    
+    pygame.draw.circle(screen, GRAY, (CENTER_X, CENTER_Y), 4)
+    
+    idle_text1 = font_large.render("WELCOME TO SURROUNDSENSE", True, WHITE)
+    idle_text2 = font_small.render("BY GEINEL NIÑO DUNGAO", True, LIGHT_GRAY)
+    idle_text3 = font_medium.render("PRESS R AND C TO START SCANNING", True, WHITE)
+    
+    text1_rect = idle_text1.get_rect(center=(CENTER_X, CENTER_Y - 50))
+    text2_rect = idle_text2.get_rect(center=(CENTER_X, CENTER_Y - 20))
+    text3_rect = idle_text3.get_rect(center=(CENTER_X, CENTER_Y + 30))
+
+    screen.blit(idle_text1, text1_rect)
+    screen.blit(idle_text2, text2_rect)
+    screen.blit(idle_text3, text3_rect)
+
+def draw_screenshot_message():
+    """DRAW SCREENSHOT SAVE STATUS MESSAGE"""
+    global screenshot_message, screenshot_timer
+    
+    if screenshot_message and pygame.time.get_ticks() < screenshot_timer:
+        msg_surface = font_medium.render(screenshot_message, True, BLACK)
+        msg_rect = msg_surface.get_rect()
+        
+        card_width = max(300, msg_rect.width + 60)
+        card_height = 80
+        card_x = (WIDTH - card_width) // 2
+        card_y = (HEIGHT - card_height) // 2
+        
+        if screenshot_message.startswith("SUCCESS|"):
+            bg_color = (240, 255, 240)
+            border_color = (100, 200, 100)
+            title_color = (0, 120, 0)
+        else:
+            bg_color = (255, 240, 240)
+            border_color = (200, 100, 100)
+            title_color = (120, 0, 0)
+        
+        card_rect = pygame.Rect(card_x, card_y, card_width, card_height)
+        pygame.draw.rect(screen, bg_color, card_rect, border_radius=12)
+        pygame.draw.rect(screen, border_color, card_rect, 3, border_radius=12)
+        
+        shadow_rect = pygame.Rect(card_x + 3, card_y + 3, card_width, card_height)
+        shadow_surface = pygame.Surface((card_width, card_height))
+        shadow_surface.set_alpha(50)
+        shadow_surface.fill((0, 0, 0))
+        screen.blit(shadow_surface, shadow_rect.topleft)
+        
+        pygame.draw.rect(screen, bg_color, card_rect, border_radius=12)
+        pygame.draw.rect(screen, border_color, card_rect, 3, border_radius=12)
+        
+        if screenshot_message.startswith("SUCCESS|"):
+            title_text = "EXPORT SUCCESS"
+        else:
+            title_text = "EXPORT FAILED"
+        
+        title_surface = font_medium.render(title_text, True, title_color)
+        title_x = card_x + 20
+        title_y = card_y + 15
+        screen.blit(title_surface, (title_x, title_y))
+        
+        display_message = screenshot_message.split("|", 1)[1] if "|" in screenshot_message else screenshot_message
+        content_surface = font_small.render(display_message, True, BLACK)
+        content_x = card_x + 20
+        content_y = card_y + 45
+        screen.blit(content_surface, (content_x, content_y))
+        
+    elif pygame.time.get_ticks() >= screenshot_timer:
+        screenshot_message = ""
+
+def draw_ui():
+    min_panel_width = 240
+    max_panel_width = 320
+    panel_width = max(min_panel_width, min(max_panel_width, WIDTH // 4))
+    
+    margin = 15
+    panel_x = WIDTH - panel_width - margin
+    panel_y = margin + PADDING_TOP
+    
+    available_height = HEIGHT - 2 * margin - 80
+    card_height = max(80, min(120, available_height // 6 - 8))
+    spacing = max(6, min(12, available_height // 35))
+    
+    if panel_x < WIDTH // 2 + 100:
+        panel_width = max(200, WIDTH - (WIDTH // 2 + 100) - margin)
+        panel_x = WIDTH - panel_width - margin
+    
+    scan_status = "PAUSED" if scan_paused else ("SCANNING" if scan_active else "IDLE")
+    scan_color = ORANGE if scan_paused else (GREEN if scan_active else GRAY)
+    
+    status_content = [
+        f"Status: {scan_status}",
+        f"Distance: {current_distance:.1f} cm" if scan_active else "Distance: —",
+        f"Angle: {get_beam_angle(sensor['yaw_instant']):.1f}°" if scan_active and get_beam_angle(sensor['yaw_instant']) else "Angle: —",
+        f"Object: {sensor['object']}" if scan_active else "Object: —"
+    ]
+    object_color = RED if scan_active and sensor["object"].lower() != "none" else scan_color
+    draw_card(screen, panel_x, panel_y, panel_width, card_height, 
+              "SENSOR STATUS", status_content, object_color)
+    
+    system_content = [
+        f"Calibrated: {'YES' if calibrated else 'NO'}",
+        f"Direction: {sensor['direction']}" if scan_active else "Direction: —",
+        f"Gyro: {sensor['gyro']}" if scan_active else "Gyro: —",
+        f"Points: {len(scan_points)}" if scan_active else "Points: 0"
+    ]
+    calib_color = GREEN if calibrated else RED
+    draw_card(screen, panel_x, panel_y + card_height + spacing, panel_width, card_height,
+              "SYSTEM", system_content, calib_color)
+    
+    if view_mode == VIEW_MODE_3D:
+        view_content = [
+            f"Mode: 3D Wireframe Style",
+            f"Zoom: {camera_zoom:.2f}x",
+            f"Rotation: {camera_rotation_x:.0f}°, {camera_rotation_y:.0f}°",
+            f"Pan: {camera_pan_x:.0f}, {camera_pan_y:.0f}"
+        ]
+    else:
+        view_content = [
+            f"Mode: 2D Radar Style",
+            "Perspective: Top-down",
+            " ",
+            "Switch to 3D for navigation"
+        ]
+    view_color = CYAN if scan_active else GRAY
+    draw_card(screen, panel_x, panel_y + 2*(card_height + spacing), panel_width, card_height,
+              "VIEW MODE", view_content, view_color)
+    
+    control_content = [
+        f"Scanning: {'PAUSED' if scan_paused else 'ACTIVE'}" if scan_active else "Scanning: INACTIVE",
+        " ",
+        "P: Pause/Resume scanning",
+        "Pause to freeze view while navigating"
+    ]
+    control_color = ORANGE if scan_paused else (GREEN if scan_active else GRAY)
+    draw_card(screen, panel_x, panel_y + 3*(card_height + spacing), panel_width, card_height,
+              "SCAN PAUSE/RESUME CONTROL", control_content, control_color)
+    
+    controls_content = [
+        "R: Reset/clear scan to center",
+        "C: Calibrate sensor to 90°",
+        "V: Switch between 2D/3D view"
+    ]
+    draw_card(screen, panel_x, panel_y + 4*(card_height + spacing), panel_width, card_height,
+              "SENSOR & VIEW CONTROLS", controls_content, BLUE)
+    
+    export_content = [
+        "Press S to save screenshot",
+        " ",
+        "S: Saves current view to your Downloads file"
+    ]
+    draw_card(screen, panel_x, panel_y + 5*(card_height + spacing), panel_width, card_height,
+              "EXPORT/SAVE", export_content, PURPLE)
+    
+    title = font_large.render("SurroundSense", True, WHITE)
+    screen.blit(title, (20, 15 + PADDING_TOP))
+    
+    range_text = font_medium.render(f"MAX RANGE: {MAX_CM}cm", True, WHITE)
+    screen.blit(range_text, (20, 45 + PADDING_TOP))
+    
+    view_mode_text = f"VIEW MODE: {'3D WIREFRAME STYLE' if view_mode == VIEW_MODE_3D else '2D RADAR STYLE'}"
+    view_text = font_medium.render(view_mode_text, True, CYAN)
+    screen.blit(view_text, (20, 70 + PADDING_TOP))
+
+def render_frame():
+    """RENDER FRAME WITH DOUBLE BUFFERING TO PREVENT FLICKER"""
+    global display_state
+    
+    if (display_state['last_width'] != WIDTH or 
+        display_state['last_height'] != HEIGHT or 
+        display_state['frame_buffer'] is None):
+        
+        display_state['frame_buffer'] = pygame.Surface((WIDTH, HEIGHT))
+        display_state['last_width'] = WIDTH
+        display_state['last_height'] = HEIGHT
+    
+    frame_buffer = display_state['frame_buffer']
+    frame_buffer.fill(BLACK)
+    
+    global screen
+    original_screen = screen
+    screen = frame_buffer
+    
+    try:
+        if scan_active:
+            if view_mode == VIEW_MODE_2D:
+                draw_radar_display()
+                draw_scan_data()
+                if beam_angle is not None and not scan_paused:
+                    beam_display_distance = clamp(beam_distance, 0.0, MAX_CM) if sensor["object"].lower() != "none" and beam_distance < MAX_CM else MAX_CM
+                    draw_beam(beam_angle, beam_display_distance)
+            else:
+                draw_3d_wireframe_view()
+        else:
+            draw_idle_screen()
+        
+        draw_ui()
+        draw_screenshot_message()
+        
+    finally:
+        screen = original_screen
+    
+    screen.blit(frame_buffer, (0, 0))
+
+# MAIN LOOP
+running = True
+while running:
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT:
+            running = False
+        elif e.type == pygame.VIDEORESIZE:
+            if not fullscreen:
+                WIDTH = max(MIN_WIDTH, e.w)
+                HEIGHT = max(MIN_HEIGHT, e.h)
+                screen = setup_display_mode(WIDTH, HEIGHT, False)
+        elif e.type == pygame.MOUSEWHEEL:
+            handle_mouse_wheel(e)
+        elif e.type == pygame.MOUSEBUTTONDOWN:
+            handle_mouse_button_down(e)
+        elif e.type == pygame.MOUSEBUTTONUP:
+            handle_mouse_button_up(e)
+        elif e.type == pygame.MOUSEMOTION:
+            handle_mouse_motion(e)
+        elif e.type == pygame.KEYDOWN:
+            # R KEY - RESET SCAN WITH DEBOUNCING AND ERROR HANDLING
+            if e.key == pygame.K_r and is_key_debounced('R'):
+                safe_reset_scan()
+            # C KEY - CALIBRATE SENSOR WITH DEBOUNCING AND ERROR HANDLING
+            elif e.key == pygame.K_c and is_key_debounced('C'):
+                safe_calibrate_sensor()
+            elif e.key == pygame.K_p and is_key_debounced('P'):
+                if scan_active:
+                    scan_paused = not scan_paused
+            elif e.key == pygame.K_v and is_key_debounced('V'):
+                if scan_active:
+                    view_mode = VIEW_MODE_3D if view_mode == VIEW_MODE_2D else VIEW_MODE_2D
+                    if view_mode == VIEW_MODE_3D:
+                        camera_zoom = 1.0
+                        camera_rotation_x = -90
+                        camera_rotation_y = 0
+                        camera_pan_x = 0
+                        camera_pan_y = 0
+            elif e.key == pygame.K_s and is_key_debounced('S'):
+                save_screenshot()
+            elif e.key == pygame.K_x and is_key_debounced('X'):
+                reset_to_idle()
+            elif e.key == pygame.K_F11:
+                fullscreen = not fullscreen
+                screen = setup_display_mode(DEFAULT_WIDTH, DEFAULT_HEIGHT, fullscreen)
+            elif e.key == pygame.K_ESCAPE:
+                if fullscreen:
+                    fullscreen = False
+                    screen = setup_display_mode(DEFAULT_WIDTH, DEFAULT_HEIGHT, False)
+
+    # ENHANCED SERIAL COMMUNICATION WITH IMPROVED ERROR HANDLING AND FILTERING
+    if ser and ser.is_open and scan_active and not scan_paused:
+        try:
+            if ser.in_waiting:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    parsed = parse_line(line)
+                    
+                    if "distance" in parsed:
+                        raw_dist = float(parsed["distance"])
+                        # APPLY ENHANCED DISTANCE FILTERING
+                        filtered_dist = advanced_distance_filter(raw_dist)
+                        sensor["distance_raw"] = raw_dist
+                        current_distance = filtered_dist
+                        beam_distance = filtered_dist
+                    
+                    if "yaw" in parsed:
+                        raw_yaw = wrap360(float(parsed["yaw"]))
+                        sensor["yaw_instant"] = raw_yaw
+                        sensor["yaw_raw"] = raw_yaw
+                    
+                    if "direction" in parsed: sensor["direction"] = parsed["direction"]
+                    if "object" in parsed: sensor["object"] = parsed["object"]
+                    if "gyro" in parsed: sensor["gyro"] = parsed["gyro"]
+        except Exception as e:
+            print(f"SERIAL READ ERROR: {e}")
+
+    # ENHANCED SCAN DATA PROCESSING WITH CORNER DETECTION AND STABILITY
+    if scan_active and not scan_paused:
+        beam_angle = get_beam_angle(sensor["yaw_instant"])
+        map_angle = get_map_angle(sensor["yaw_raw"])
+
+        if map_angle is not None and 0 <= map_angle <= 180:
+            angle_key = int(round(map_angle))
+            has_object = sensor["object"].lower() != "none" and current_distance <= MAX_CM
+            
+            # APPLY CORNER DETECTION FOR ENHANCED ACCURACY
+            is_corner = detect_corner_and_optimize(map_angle, current_distance)
+            
+            display_distance = current_distance if has_object else MAX_CM
+            
+            # ENHANCED SCAN POINT STORAGE WITH CORNER DETECTION INFO
+            scan_points[angle_key] = {
+                'coord': polar_to_xy(angle_key, min(display_distance, MAX_CM)),
+                'has_object': has_object,
+                'distance': current_distance,
+                'is_corner': is_corner,
+                'stability_score': len(angle_stability_buffer) / ANGLE_STABILITY_N  # STABILITY INDICATOR
+            }
+    else:
+        beam_angle = get_beam_angle(sensor["yaw_instant"]) if scan_active else None
+
+    render_frame()
     pygame.display.flip()
     clock.tick(60)
 
+try:
+    if ser and ser.is_open:
+        ser.close()
+except:
+    pass
 pygame.quit()
