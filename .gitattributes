@@ -1,0 +1,47 @@
+#Hide HTML files from GitHub language statistics
+*.html linguist-detectable=false
+*.htm linguist-detectable=false
+
+# Force C++ language detection for all related files
+*.cpp linguist-language=C++
+*.hpp linguist-language=C++
+*.h linguist-language=C++
+*.cc linguist-language=C++
+*.cxx linguist-language=C++
+*.c linguist-language=C++
+
+# Force Python language detection
+*.py linguist-language=Python
+*.pyw linguist-language=Python
+
+# Also hide web-related files that might interfere
+*.css linguist-detectable=false
+*.js linguist-detectable=false
+*.xml linguist-detectable=false
+
+# Hide build and distribution directories
+dist/* linguist-detectable=false
+build/* linguist-detectable=false
+__pycache__/* linguist-detectable=false
+*.egg-info/* linguist-detectable=false
+
+# Hide configuration and build files
+*.spec linguist-detectable=false
+*.pyc linguist-detectable=false
+*.pyo linguist-detectable=false
+*.pyd linguist-detectable=false
+*.so linguist-detectable=false
+*.dll linguist-detectable=false
+
+# Hide documentation files from language stats
+*.md linguist-documentation=true
+*.txt linguist-documentation=true
+*.rst linguist-documentation=true
+
+# Hide configuration files
+*.json linguist-detectable=false
+*.yaml linguist-detectable=false
+*.yml linguist-detectable=false
+*.toml linguist-detectable=false
+*.cfg linguist-detectable=false
+*.ini linguist-detectable=false
