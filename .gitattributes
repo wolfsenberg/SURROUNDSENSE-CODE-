@@ -1,6 +1,10 @@
-#Hide HTML files from GitHub language statistics
+#Hide HTML and TeX files from GitHub language statistics
 *.html linguist-detectable=false
 *.htm linguist-detectable=false
+*.tex linguist-detectable=false
+*.latex linguist-detectable=false
+*.sty linguist-detectable=false
+*.cls linguist-detectable=false
 
 # Force C++ language detection for all related files
 *.cpp linguist-language=C++
