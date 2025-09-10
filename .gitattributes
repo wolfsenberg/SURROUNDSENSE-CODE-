@@ -1,4 +1,4 @@
-#Hide HTML and TeX files from GitHub language statistics
+# Hide HTML and TeX files from GitHub language statistics
 *.html linguist-detectable=false
 *.htm linguist-detectable=false
 
@@ -11,6 +11,12 @@
 *.ins linguist-detectable=false
 *.bib linguist-detectable=false
 *.bst linguist-detectable=false
+*.toc linguist-detectable=false
+*.aux linguist-detectable=false
+*.log linguist-detectable=false
+*.out linguist-detectable=false
+*.fls linguist-detectable=false
+*.fdb_latexmk linguist-detectable=false
 
 # Alternative approach: Force TeX files to be treated as documentation
 *.tex linguist-documentation=true
