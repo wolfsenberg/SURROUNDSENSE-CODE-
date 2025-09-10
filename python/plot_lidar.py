@@ -7,7 +7,6 @@ import time
 import math
 from collections import deque
 from datetime import datetime
-import numpy as np
 
 def find_arduino_port():
     """AUTO-DETECT ARDUINO COM PORT"""
