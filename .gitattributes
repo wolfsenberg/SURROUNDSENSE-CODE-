@@ -1,10 +1,20 @@
 #Hide HTML and TeX files from GitHub language statistics
 *.html linguist-detectable=false
 *.htm linguist-detectable=false
+
+# Hide ALL TeX/LaTeX related files
 *.tex linguist-detectable=false
 *.latex linguist-detectable=false
 *.sty linguist-detectable=false
 *.cls linguist-detectable=false
+*.dtx linguist-detectable=false
+*.ins linguist-detectable=false
+*.bib linguist-detectable=false
+*.bst linguist-detectable=false
+
+# Alternative approach: Force TeX files to be treated as documentation
+*.tex linguist-documentation=true
+*.latex linguist-documentation=true
 
 # Force C++ language detection for all related files
 *.cpp linguist-language=C++
@@ -22,6 +32,26 @@
 *.css linguist-detectable=false
 *.js linguist-detectable=false
 *.xml linguist-detectable=false
+
+# Hide other documentation formats
+*.md linguist-documentation=true
+*.txt linguist-documentation=true
+*.rst linguist-documentation=true
+
+# Hide build and distribution directories
+dist/* linguist-detectable=false
+build/* linguist-detectable=false
+__pycache__/* linguist-detectable=false
+*.egg-info/* linguist-detectable=false
+
+# Hide configuration files
+*.json linguist-detectable=false
+*.yaml linguist-detectable=false
+*.yml linguist-detectable=false
+*.toml linguist-detectable=false
+*.cfg linguist-detectable=false
+*.ini linguist-detectable=false
+*.spec linguist-detectable=false
 
 # Hide build and distribution directories
 dist/* linguist-detectable=false
